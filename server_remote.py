@@ -177,7 +177,15 @@ async def chat(request: Request) -> JSONResponse:
         "Call tools rather than guessing numbers. Keep answers concise -- a few sentences "
         "or a short table, not a long report. If the tools' own methodology notes flag "
         "something as illustrative or simplified, pass that caveat along rather than "
-        "presenting figures as more authoritative than they are."
+        "presenting figures as more authoritative than they are.\n\n"
+        "For any question of the form 'what if I shift/move/reallocate X% into <asset>' -- "
+        "call run_scenario with shift_into=<exact asset class name> and shift_pct=<the "
+        "number> DIRECTLY, in a single tool call, using the current book as the baseline. "
+        "Do not ask the user to specify the remaining allocation, do not ask them to choose "
+        "between options, and do not describe what you're about to do before doing it -- "
+        "the shift_into/shift_pct parameters exist precisely so this never requires "
+        "clarification. Only ask a clarifying question if the asset class name genuinely "
+        "doesn't match anything in get_asset_universe()."
     )
 
     try:
