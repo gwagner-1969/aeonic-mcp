@@ -103,4 +103,3 @@ if __name__ == "__main__":
     print(f"Starting aeonic-digital-collateral in {mode} mode on port {port}")
     print(f"Allowed hosts: {ALLOWED_HOSTS}")
     uvicorn.run(app, host="0.0.0.0", port=port)
-
