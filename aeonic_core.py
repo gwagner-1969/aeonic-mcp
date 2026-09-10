@@ -212,6 +212,7 @@ def compute_metrics(allocation: list[float]) -> dict:
     capital_required = rwa_total * CONST["capital_ratio"]
 
     return {
+        "total_book_mm": round(CONST["total_book"], 1),
         "hqla_stock_mm": round(hqla_total, 1),
         "lcr": round(lcr, 4),
         "rsf_mm": round(rsf_total, 1),
@@ -270,14 +271,28 @@ def register_tools(mcp) -> None:
         return json.dumps(ASSETS, indent=2)
 
     @mcp.tool()
-    def run_scenario(allocation: Optional[dict[str, float]] = None, preset: Optional[str] = None) -> str:
+    def run_scenario(allocation: Optional[dict[str, float]] = None, preset: Optional[str] = None,
+                      shift_into: Optional[str] = None, shift_pct: Optional[float] = None) -> str:
         """Run the LCR/NSFR/Capital/funding-cost model for a given collateral allocation and
         compare it to the current book.
 
-        Provide EITHER:
-          - preset: one of "current", "scenario_a" (Tokenization Tilt), "scenario_b" (Aggressive Tokenization)
-          - allocation: a dict mapping asset class name -> percentage of book (0-100), covering some or
-            all of the 9 asset classes in get_asset_universe(). Percentages should sum to 100.
+        Provide EXACTLY ONE of these three ways to specify the scenario:
+
+          1. preset: one of "current", "scenario_a" (Tokenization Tilt), "scenario_b" (Aggressive Tokenization)
+
+          2. shift_into + shift_pct: THE RIGHT CHOICE for questions like "what if I move 30% of the
+             book into DTCC-tokenized Treasuries" or "shift 20 points into X". Give shift_into as an
+             exact asset class name from get_asset_universe(), and shift_pct as the number of
+             percentage points to move into it (e.g. 30 for "30%"). This adds shift_pct to that
+             asset's current share and proportionally reduces every OTHER asset class to compensate,
+             preserving their relative proportions to each other -- the correct interpretation of
+             "shift X% into Y, keep the rest as-is". Do NOT try to construct this by hand via the
+             'allocation' parameter below; the proportional math is easy to get wrong, which is why
+             this dedicated option exists.
+
+          3. allocation: a dict mapping EVERY ONE of the 9 asset class names to a percentage of book
+             (0-100), summing to 100. Only use this when the caller wants to specify a full custom
+             mix from scratch, not for "shift into X" style questions.
 
         Returns LCR, NSFR, HQLA stock, RWA, capital required, annual funding cost, and the deltas
         (capital released, funding cost saved, net annualized value created) versus the current book.
@@ -286,6 +301,42 @@ def register_tools(mcp) -> None:
             if preset not in PRESETS:
                 return json.dumps({"error": f"Unknown preset '{preset}'. Use one of: {list(PRESETS.keys())}"})
             alloc = PRESETS[preset]
+            shift_summary = None
+        elif shift_into is not None and shift_pct is not None:
+            if shift_into not in ASSET_NAMES:
+                return json.dumps({
+                    "error": f"Unknown asset class '{shift_into}'.",
+                    "valid_asset_classes": ASSET_NAMES,
+                })
+            idx = ASSET_NAMES.index(shift_into)
+            base = PRESETS["current"]
+            s = shift_pct / 100.0
+            cur_i = base[idx]
+            denom = 1.0 - cur_i
+            if s < 0 or s > denom + 1e-9:
+                return json.dumps({
+                    "error": f"Cannot shift {shift_pct} points into '{shift_into}': only "
+                             f"{denom*100:.1f} percentage points are available to move from other "
+                             f"asset classes (current share of '{shift_into}' is {cur_i*100:.1f}%).",
+                })
+            scale = (1 - s / denom) if denom > 1e-9 else 0.0
+            alloc = [
+                (cur_i + s) if j == idx else base[j] * scale
+                for j in range(len(ASSET_NAMES))
+            ]
+            # Report the exact dollar figures for this shift so the caller never has to
+            # (mis)calculate them itself -- this is the fix for a real observed failure
+            # mode where the calling model invented a plausible-sounding but wrong dollar
+            # amount instead of using this.
+            shift_summary = {
+                "asset": shift_into,
+                "shift_pct_requested": shift_pct,
+                "old_share_pct": round(cur_i * 100, 2),
+                "new_share_pct": round((cur_i + s) * 100, 2),
+                "old_notional_mm": round(cur_i * CONST["total_book"], 1),
+                "new_notional_mm": round((cur_i + s) * CONST["total_book"], 1),
+                "notional_added_mm": round(s * CONST["total_book"], 1),
+            }
         elif allocation:
             alloc = [allocation.get(name, 0.0) / 100.0 for name in ASSET_NAMES]
             total = sum(alloc)
@@ -295,16 +346,20 @@ def register_tools(mcp) -> None:
                              f"Provide percentages for all asset classes summing to 100.",
                     "valid_asset_classes": ASSET_NAMES,
                 })
+            shift_summary = None
         else:
-            return json.dumps({"error": "Provide either 'preset' or 'allocation'.", "valid_presets": list(PRESETS.keys()),
-                                "valid_asset_classes": ASSET_NAMES})
+            return json.dumps({
+                "error": "Provide 'preset', or 'shift_into'+'shift_pct', or a full 'allocation'.",
+                "valid_presets": list(PRESETS.keys()),
+                "valid_asset_classes": ASSET_NAMES,
+            })
 
         result = compute_metrics(alloc)
         capital_released = CURRENT_METRICS["capital_required_mm"] - result["capital_required_mm"]
         funding_savings = CURRENT_METRICS["annual_funding_cost_mm"] - result["annual_funding_cost_mm"]
         net_value = capital_released * CONST["return_on_capital"] + funding_savings
 
-        return json.dumps({
+        response = {
             "result": result,
             "vs_current": {
                 "lcr_current": CURRENT_METRICS["lcr"],
@@ -316,7 +371,10 @@ def register_tools(mcp) -> None:
             "methodology_note": "Illustrative demonstration model with representative sample data. "
                                  "Regulatory factors are simplified approximations of Basel III, not a "
                                  "production regulatory-reporting engine.",
-        }, indent=2)
+        }
+        if shift_summary:
+            response["shift_summary"] = shift_summary
+        return json.dumps(response, indent=2)
 
     @mcp.tool()
     def classify_asset(has_traditional_id: bool, is_direct_beneficial_ownership: bool,
