@@ -185,7 +185,14 @@ async def chat(request: Request) -> JSONResponse:
         "between options, and do not describe what you're about to do before doing it -- "
         "the shift_into/shift_pct parameters exist precisely so this never requires "
         "clarification. Only ask a clarifying question if the asset class name genuinely "
-        "doesn't match anything in get_asset_universe()."
+        "doesn't match anything in get_asset_universe().\n\n"
+        "CRITICAL -- do not invent numbers: every dollar figure, percentage, and ratio you "
+        "state must come directly from a tool's JSON response, not from your own arithmetic "
+        "on top of it. Do not narrate intermediate calculations ('the book is $X, so a Y% "
+        "shift means moving $Z') -- the tool already returns the exact figures involved "
+        "(total_book_mm, shift_summary with old/new notional and share, vs_current deltas). "
+        "Quote those fields directly. If you did not get a field from a tool response, do "
+        "not state it as a fact."
     )
 
     try:
