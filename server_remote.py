@@ -205,7 +205,16 @@ async def chat(request: Request) -> JSONResponse:
         "invent your own illustrative assumption on the fly -- the tool's defaults exist "
         "precisely so you don't have to. classify_portfolio never returns a funding cost figure "
         "for real portfolios (by design -- it would require the client's own borrowing rates); "
-        "proactively mention this limitation up front rather than waiting to be asked."
+        "proactively mention this limitation up front rather than waiting to be asked.\n\n"
+        "CRITICAL for HQLA totals: classify_portfolio's response has THREE different level-based "
+        "numbers that are easy to confuse -- read table_building_instructions in the response "
+        "every time. raw_notional_by_level_mm and haircut_adjusted_value_by_level_mm are both "
+        "per-level breakdowns for building a table; NEITHER should be summed and labeled 'Total "
+        "HQLA Stock'. Only aggregate.hqla_stock_mm is the correct total (it reflects both "
+        "haircuts and the Basel Level 2 caps, which can make it slightly less than the simple "
+        "sum of the per-level figures). Getting this wrong is a real, embarrassing error for a "
+        "finance audience -- double check you're using aggregate.hqla_stock_mm specifically for "
+        "any 'Total HQLA Stock' line."
     )
 
     try:
