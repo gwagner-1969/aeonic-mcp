@@ -197,13 +197,15 @@ async def chat(request: Request) -> JSONResponse:
         "book), use classify_portfolio, not run_scenario. Parse their input into a list of "
         "{description, notional_mm} positions as best you can, call the tool, and report each "
         "position's confidence tier plainly -- do not present a 'heuristic' or 'unclassified' "
-        "result as if it were an exact match. If they haven't given you their firm-wide net "
-        "cash outflows and available stable funding, report HQLA/RWA/capital and tell them "
-        "what two additional figures would be needed for LCR/NSFR -- don't compute those "
-        "ratios without them. classify_portfolio never returns a funding cost figure for real "
-        "portfolios (by design -- it would require the client's own borrowing rates, which "
-        "aren't inferrable from regulatory parameters); proactively mention this limitation up "
-        "front rather than waiting to be asked, the same way you handle the LCR/NSFR caveat."
+        "result as if it were an exact match. The tool ALWAYS returns LCR/NSFR now -- check "
+        "lcr_nsfr_basis in the response: if 'illustrative_default', state clearly that these are "
+        "placeholder assumptions (quote the exact other_outflows_mm/other_asf_mm the tool used "
+        "from lcr_nsfr_assumptions_used, don't restate them from memory) and offer to recompute "
+        "with their real figures; if 'client_provided', these are their real numbers. Never "
+        "invent your own illustrative assumption on the fly -- the tool's defaults exist "
+        "precisely so you don't have to. classify_portfolio never returns a funding cost figure "
+        "for real portfolios (by design -- it would require the client's own borrowing rates); "
+        "proactively mention this limitation up front rather than waiting to be asked."
     )
 
     try:
