@@ -660,6 +660,13 @@ def register_tools(mcp) -> None:
             other_asf_mm or 0.0,
             include_lcr_nsfr=include_lcr_nsfr,
         )
+        # Funding cost is inherently market/credit-specific (negotiated borrowing rates), unlike
+        # haircuts/risk weights which are standardized regulatory parameters. The illustrative
+        # demo book's cost-of-funds curve has zero claim to reflect a real client's actual
+        # borrowing costs, so it's never surfaced here -- same discipline as LCR/NSFR above,
+        # applied to the one other figure that was leaking illustrative assumptions into a
+        # real-portfolio result.
+        del result["annual_funding_cost_mm"]
 
         by_level_mm = {}
         for p in classified:
@@ -675,10 +682,16 @@ def register_tools(mcp) -> None:
             "confidence_summary": confidence_counts,
             "aggregate": result,
             "methodology_note": "Illustrative classification tool. 'exact_match' positions use "
-                                 "precise regulatory factors from Aeonic's known asset universe; "
-                                 "'heuristic' and 'unclassified' positions use generic default "
-                                 "assumptions and need manual review before being relied upon. "
-                                 "This does not replace your own regulatory reporting process.",
+                                 "precise regulatory factors (haircut, risk weight, RSF) from "
+                                 "Aeonic's known asset universe; 'heuristic' and 'unclassified' "
+                                 "positions use generic default assumptions and need manual "
+                                 "review before being relied upon. This does not replace your "
+                                 "own regulatory reporting process.",
+            "funding_cost_note": "Annual funding cost is not computed for real portfolios -- it "
+                                  "would require YOUR actual borrowing rates and credit spreads "
+                                  "per asset class, which aren't derivable from regulatory "
+                                  "parameters the way haircuts and risk weights are. Provide your "
+                                  "own blended cost of funds if you want that figure estimated.",
         }
         if not include_lcr_nsfr:
             response["lcr_nsfr_note"] = (
