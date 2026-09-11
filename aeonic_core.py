@@ -595,6 +595,13 @@ def register_tools(mcp) -> None:
 
         return json.dumps({"live_data": results, "errors": errors or None}, indent=2)
 
+    # Illustrative-default assumptions for firm-wide LCR/NSFR inputs, used only when the caller
+    # doesn't supply their own real figures. Defined once, here, as named constants -- not
+    # improvised per-conversation -- so the numbers are reproducible and the tool's own JSON
+    # output states exactly what was assumed, leaving nothing for the caller to mis-describe.
+    ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK = 0.25   # planning-level assumption, not derived from data
+    ILLUSTRATIVE_ASF_PCT_OF_BOOK = 1.00       # planning-level assumption, not derived from data
+
     @mcp.tool()
     def classify_portfolio(positions: list[dict], other_outflows_mm: Optional[float] = None,
                             other_asf_mm: Optional[float] = None) -> str:
@@ -608,19 +615,19 @@ def register_tools(mcp) -> None:
                 - "description": free-text description of the position (e.g. "US Treasury Bill",
                   "Agency MBS pool", "corporate bond - Acme Corp")
                 - "notional_mm": the position's notional value in $ millions
-            other_outflows_mm: OPTIONAL. The client's total firm-wide 30-day net cash outflows
-                from everything OUTSIDE this position list (retail/wholesale funding runoff, etc.).
-                Without this, LCR cannot be computed meaningfully -- see note below.
-            other_asf_mm: OPTIONAL. The client's total firm-wide available stable funding from
-                outside this position list (equity, long-term debt, stable deposits). Without
-                this, NSFR cannot be computed meaningfully -- see note below.
+            other_outflows_mm: OPTIONAL. The client's REAL total firm-wide 30-day net cash
+                outflows from everything OUTSIDE this position list. If omitted, LCR is still
+                computed using a clearly-labeled illustrative default (25% of book) -- not
+                skipped -- see "confidence" field in the response.
+            other_asf_mm: OPTIONAL. The client's REAL total firm-wide available stable funding
+                from outside this position list. If omitted, NSFR is still computed using a
+                clearly-labeled illustrative default (100% of book) -- not skipped.
 
-        IMPORTANT: LCR and NSFR both depend on firm-wide numbers (total funding runoff, total
-        stable funding) that live OUTSIDE a position list -- they can't be derived from the
-        positions alone. If other_outflows_mm and other_asf_mm are not both provided, this tool
-        returns HQLA stock, RWA, and capital required (all fully computable from positions alone),
-        but explicitly omits LCR/NSFR rather than computing them against a wrong assumption.
-        Tell the user their LCR/NSFR need those two figures if they want them.
+        LCR and NSFR are ALWAYS returned -- either computed from the client's own real firm-wide
+        figures (if both are provided) or from stated illustrative defaults (if not). The response
+        includes an explicit "lcr_nsfr_basis" field ("client_provided" or "illustrative_default")
+        and the exact assumption values used -- always quote those fields directly, never restate
+        or re-derive the assumption yourself, and always tell the user which basis was used.
 
         Each position is classified with a confidence tier: "exact_match" (matched one of the 9
         known asset categories, using its precise regulatory factors), "heuristic" (no exact
@@ -653,12 +660,19 @@ def register_tools(mcp) -> None:
             })
             model_positions.append({"notional_mm": notional, "level": c["level"], **c["attributes"]})
 
-        include_lcr_nsfr = other_outflows_mm is not None and other_asf_mm is not None
+        total_book = sum(p["notional_mm"] for p in positions)
+        client_provided = other_outflows_mm is not None and other_asf_mm is not None
+        if client_provided:
+            used_outflows = other_outflows_mm
+            used_asf = other_asf_mm
+            lcr_nsfr_basis = "client_provided"
+        else:
+            used_outflows = round(total_book * ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK, 1)
+            used_asf = round(total_book * ILLUSTRATIVE_ASF_PCT_OF_BOOK, 1)
+            lcr_nsfr_basis = "illustrative_default"
+
         result = _compute_from_positions(
-            model_positions,
-            other_outflows_mm or 0.0,
-            other_asf_mm or 0.0,
-            include_lcr_nsfr=include_lcr_nsfr,
+            model_positions, used_outflows, used_asf, include_lcr_nsfr=True,
         )
         # Funding cost is inherently market/credit-specific (negotiated borrowing rates), unlike
         # haircuts/risk weights which are standardized regulatory parameters. The illustrative
@@ -681,6 +695,11 @@ def register_tools(mcp) -> None:
             "by_level_mm": {k: round(v, 1) for k, v in by_level_mm.items()},
             "confidence_summary": confidence_counts,
             "aggregate": result,
+            "lcr_nsfr_basis": lcr_nsfr_basis,
+            "lcr_nsfr_assumptions_used": {
+                "other_outflows_mm": used_outflows,
+                "other_asf_mm": used_asf,
+            },
             "methodology_note": "Illustrative classification tool. 'exact_match' positions use "
                                  "precise regulatory factors (haircut, risk weight, RSF) from "
                                  "Aeonic's known asset universe; 'heuristic' and 'unclassified' "
@@ -693,10 +712,13 @@ def register_tools(mcp) -> None:
                                   "parameters the way haircuts and risk weights are. Provide your "
                                   "own blended cost of funds if you want that figure estimated.",
         }
-        if not include_lcr_nsfr:
+        if lcr_nsfr_basis == "illustrative_default":
             response["lcr_nsfr_note"] = (
-                "LCR and NSFR were not computed because other_outflows_mm and/or other_asf_mm "
-                "were not provided -- these firm-wide figures can't be derived from a position "
-                "list alone. Provide both to get LCR/NSFR for this portfolio."
+                f"LCR/NSFR above use ILLUSTRATIVE placeholder assumptions, not your real figures: "
+                f"other net cash outflows assumed at {ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK*100:.0f}% of "
+                f"book (${used_outflows}mm), other available stable funding assumed at "
+                f"{ILLUSTRATIVE_ASF_PCT_OF_BOOK*100:.0f}% of book (${used_asf}mm). These are "
+                f"round-number planning assumptions, not derived from your data. Provide your "
+                f"real other_outflows_mm and other_asf_mm for an accurate LCR/NSFR."
             )
         return json.dumps(response, indent=2)
