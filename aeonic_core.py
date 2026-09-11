@@ -179,53 +179,160 @@ def outflow_factor(level: str) -> float:
     return {"Level 1": 0.00, "Level 2A": 0.15, "Level 2B": 0.25}.get(level, 1.00)
 
 
-def compute_metrics(allocation: list[float]) -> dict:
-    """allocation: list of 9 fractions (0-1), same order as ASSETS, should sum to ~1.0"""
-    notionals = [p * CONST["total_book"] for p in allocation]
+def _compute_from_positions(positions: list[dict], other_outflows_mm: float, other_asf_mm: float,
+                             include_lcr_nsfr: bool = True) -> dict:
+    """Core engine, generalized to any list of positions (not just the fixed 9-asset book).
+    Each position dict needs: notional_mm, level, haircut, rsf, rw, tenor, spread_bps.
+    other_outflows_mm/other_asf_mm are firm-wide figures outside this position list --
+    required for a meaningful LCR/NSFR (see classify_portfolio's docstring for why)."""
     level1 = level2a = level2b = 0.0
     outflow_asset = rsf_total = asf_asset = rwa_total = funding_cost = 0.0
+    total_book = sum(p["notional_mm"] for p in positions)
 
-    for asset, notional in zip(ASSETS, notionals):
-        tenor = TENORS[asset["tenor"]]
-        hqla_val = 0.0 if asset["level"] == "Not HQLA" else notional * (1 - asset["haircut"])
-        if asset["level"] == "Level 1":
+    for p in positions:
+        tenor = TENORS[p["tenor"]]
+        notional = p["notional_mm"]
+        hqla_val = 0.0 if p["level"] == "Not HQLA" else notional * (1 - p["haircut"])
+        if p["level"] == "Level 1":
             level1 += hqla_val
-        elif asset["level"] == "Level 2A":
+        elif p["level"] == "Level 2A":
             level2a += hqla_val
-        elif asset["level"] == "Level 2B":
+        elif p["level"] == "Level 2B":
             level2b += hqla_val
-        of = outflow_factor(asset["level"])
+        of = outflow_factor(p["level"])
         if tenor["outflow_eligible"]:
             outflow_asset += notional * of
-        rsf_total += notional * asset["rsf"]
+        rsf_total += notional * p["rsf"]
         asf_asset += notional * tenor["asf"]
-        rwa_total += notional * asset["rw"]
-        funding_cost += notional * (tenor["secured"] + asset["spread_bps"] / 10000)
+        rwa_total += notional * p["rw"]
+        funding_cost += notional * (tenor["secured"] + p["spread_bps"] / 10000)
 
     level2b_capped = min(level2b, (CONST["level2b_cap"] / (1 - CONST["level2b_cap"])) * (level1 + level2a))
     level2_capped = min(level2a + level2b_capped, (CONST["level2_cap"] / (1 - CONST["level2_cap"])) * level1)
     hqla_total = level1 + level2_capped
-    total_outflow = outflow_asset + CONST["other_outflows"]
-    lcr = hqla_total / total_outflow
-    asf_total = asf_asset + CONST["other_asf"]
-    nsfr = asf_total / rsf_total
-    capital_required = rwa_total * CONST["capital_ratio"]
+    rwa_capital = rwa_total * CONST["capital_ratio"]
 
-    return {
-        "total_book_mm": round(CONST["total_book"], 1),
+    result = {
+        "total_book_mm": round(total_book, 1),
         "hqla_stock_mm": round(hqla_total, 1),
-        "lcr": round(lcr, 4),
         "rsf_mm": round(rsf_total, 1),
-        "asf_mm": round(asf_total, 1),
-        "nsfr": round(nsfr, 4),
         "rwa_mm": round(rwa_total, 1),
-        "capital_required_mm": round(capital_required, 2),
+        "capital_required_mm": round(rwa_capital, 2),
         "annual_funding_cost_mm": round(funding_cost, 2),
-        "notionals_mm": {a["name"]: round(n, 1) for a, n in zip(ASSETS, notionals)},
     }
+    if include_lcr_nsfr:
+        total_outflow = outflow_asset + other_outflows_mm
+        asf_total = asf_asset + other_asf_mm
+        result["lcr"] = round(hqla_total / total_outflow, 4) if total_outflow > 0 else None
+        result["nsfr"] = round(asf_total / rsf_total, 4) if rsf_total > 0 else None
+        result["asf_mm"] = round(asf_total, 1)
+    return result
+
+
+def compute_metrics(allocation: list[float]) -> dict:
+    """allocation: list of 9 fractions (0-1), same order as ASSETS, should sum to ~1.0"""
+    notionals = [p * CONST["total_book"] for p in allocation]
+    positions = [
+        {"notional_mm": n, "level": a["level"], "haircut": a["haircut"], "rsf": a["rsf"],
+         "rw": a["rw"], "tenor": a["tenor"], "spread_bps": a["spread_bps"]}
+        for a, n in zip(ASSETS, notionals)
+    ]
+    result = _compute_from_positions(positions, CONST["other_outflows"], CONST["other_asf"])
+    result["notionals_mm"] = {a["name"]: round(n, 1) for a, n in zip(ASSETS, notionals)}
+    return result
 
 
 CURRENT_METRICS = compute_metrics(PRESETS["current"])
+
+
+# =====================================================================
+# Real-portfolio classification (distinct from the illustrative 9-asset
+# book above). Three confidence tiers, all surfaced to the caller so
+# nothing is silently guessed.
+# =====================================================================
+
+# Default regulatory attributes per HQLA bucket, used only when a position
+# doesn't match one of the 9 known asset classes exactly. These are
+# reasonable Basel-style defaults for that bucket, not client-specific --
+# always lower confidence than an exact match.
+LEVEL_DEFAULTS = {
+    "Level 1": {"haircut": 0.005, "rsf": 0.05, "rw": 0.00, "tenor": "O/N", "spread_bps": 0},
+    "Level 2A": {"haircut": 0.25, "rsf": 0.20, "rw": 0.20, "tenor": "3M", "spread_bps": 10},
+    "Level 2B": {"haircut": 0.50, "rsf": 0.50, "rw": 1.00, "tenor": "3M", "spread_bps": 15},
+    "Not HQLA": {"haircut": 0.00, "rsf": 1.00, "rw": 1.00, "tenor": "6M", "spread_bps": 30},
+}
+
+# Keyword -> known asset class, checked most-specific-first (tokenized
+# variants before their generic counterparts) so "tokenized treasury"
+# doesn't get caught by the generic "treasury" keyword.
+KNOWN_CATEGORY_KEYWORDS = [
+    (["tokenized treasury", "digital treasury", "dtcc treasury", "dtcc-tokenized treasur"],
+     "U.S. Treasuries (DTCC-Tokenized)"),
+    (["treasury", "t-bill", "t-note", "t-bond", "us treasury", "government bond", "sovereign debt"],
+     "U.S. Treasuries (Traditional)"),
+    (["tokenized etf", "digital etf", "dtcc-tokenized etf", "dtcc etf"],
+     "Major-Index ETFs (DTCC-Tokenized)"),
+    (["etf", "exchange-traded fund", "exchange traded fund"],
+     "Major-Index ETFs (Traditional)"),
+    (["tokenized equity", "tokenized stock", "russell 1000", "dtcc-tokenized equit"],
+     "Russell 1000 Equities (DTCC-Tokenized)"),
+    (["agency mbs", "mortgage-backed", "mortgage backed", "gnma", "fnma", "freddie mac", "fannie mae"],
+     "Agency MBS"),
+    (["investment-grade corporate", "investment grade corporate", "ig corporate", "corporate bond"],
+     "Investment-Grade Corporates"),
+    (["cash", "central bank reserve", "central bank deposit"],
+     "Cash / Central Bank Reserves"),
+]
+
+# Keyword -> HQLA level, used only when no known-category match is found.
+# Order matters: more specific / higher-quality indicators first.
+HEURISTIC_LEVEL_KEYWORDS = [
+    (["sovereign", "government-guaranteed", "supranational", "multilateral development bank"], "Level 1"),
+    (["agency", "gse", "covered bond"], "Level 2A"),
+    (["corporate bond", "convertible bond", "investment grade"], "Level 2B"),
+    (["equity", "common stock", "preferred stock", "private credit", "loan", "receivable",
+      "real estate", "commodity"], "Not HQLA"),
+]
+
+
+def classify_position(description: str) -> dict:
+    """Classify one free-text position description. Returns level, the regulatory
+    attributes to use, a confidence tier, and a human-readable rationale."""
+    desc_lower = description.lower()
+
+    for keywords, asset_name in KNOWN_CATEGORY_KEYWORDS:
+        if any(kw in desc_lower for kw in keywords):
+            asset = next(a for a in ASSETS if a["name"] == asset_name)
+            return {
+                "level": asset["level"],
+                "attributes": {k: asset[k] for k in ["haircut", "rsf", "rw", "tenor", "spread_bps"]},
+                "confidence": "exact_match",
+                "matched_category": asset_name,
+                "rationale": f"Matched known asset category '{asset_name}' -- using its exact "
+                             f"regulatory factors from the Asset Universe.",
+            }
+
+    for keywords, level in HEURISTIC_LEVEL_KEYWORDS:
+        if any(kw in desc_lower for kw in keywords):
+            return {
+                "level": level,
+                "attributes": LEVEL_DEFAULTS[level],
+                "confidence": "heuristic",
+                "matched_category": None,
+                "rationale": f"No exact match in the known asset universe. Keyword pattern suggests "
+                             f"{level} -- using default {level} regulatory assumptions, NOT a "
+                             f"client-specific determination. Verify before relying on this.",
+            }
+
+    return {
+        "level": "Not HQLA",
+        "attributes": LEVEL_DEFAULTS["Not HQLA"],
+        "confidence": "unclassified",
+        "matched_category": None,
+        "rationale": "Could not confidently classify this description. Defaulted to Not HQLA "
+                     "(the conservative assumption) -- this needs manual review, not automated "
+                     "reliance.",
+    }
 
 
 def _eth_call(client: httpx.Client, to: str, data: str) -> str:
@@ -487,3 +594,96 @@ def register_tools(mcp) -> None:
         results.append(ustb_result)
 
         return json.dumps({"live_data": results, "errors": errors or None}, indent=2)
+
+    @mcp.tool()
+    def classify_portfolio(positions: list[dict], other_outflows_mm: Optional[float] = None,
+                            other_asf_mm: Optional[float] = None) -> str:
+        """Classify a REAL client portfolio (not the illustrative demo book) into HQLA levels and
+        compute HQLA stock, RWA, and capital required. Use this whenever a user pastes or describes
+        their own actual positions, as opposed to run_scenario (which only works with the fixed
+        illustrative 9-asset demo book).
+
+        Args:
+            positions: a list of dicts, each with:
+                - "description": free-text description of the position (e.g. "US Treasury Bill",
+                  "Agency MBS pool", "corporate bond - Acme Corp")
+                - "notional_mm": the position's notional value in $ millions
+            other_outflows_mm: OPTIONAL. The client's total firm-wide 30-day net cash outflows
+                from everything OUTSIDE this position list (retail/wholesale funding runoff, etc.).
+                Without this, LCR cannot be computed meaningfully -- see note below.
+            other_asf_mm: OPTIONAL. The client's total firm-wide available stable funding from
+                outside this position list (equity, long-term debt, stable deposits). Without
+                this, NSFR cannot be computed meaningfully -- see note below.
+
+        IMPORTANT: LCR and NSFR both depend on firm-wide numbers (total funding runoff, total
+        stable funding) that live OUTSIDE a position list -- they can't be derived from the
+        positions alone. If other_outflows_mm and other_asf_mm are not both provided, this tool
+        returns HQLA stock, RWA, and capital required (all fully computable from positions alone),
+        but explicitly omits LCR/NSFR rather than computing them against a wrong assumption.
+        Tell the user their LCR/NSFR need those two figures if they want them.
+
+        Each position is classified with a confidence tier: "exact_match" (matched one of the 9
+        known asset categories, using its precise regulatory factors), "heuristic" (no exact
+        match, classified by keyword pattern using default assumptions for that HQLA level --
+        lower confidence, flag this to the user), or "unclassified" (no confident match at all,
+        conservatively defaulted to Not HQLA, needs manual review). Always surface each position's
+        confidence tier and rationale to the user -- do not present heuristic or unclassified
+        results as if they were exact matches.
+        """
+        if not positions:
+            return json.dumps({"error": "Provide a non-empty list of positions."})
+
+        classified = []
+        model_positions = []
+        for i, pos in enumerate(positions):
+            desc = pos.get("description", "")
+            notional = pos.get("notional_mm")
+            if not desc or notional is None:
+                return json.dumps({
+                    "error": f"Position {i} is missing 'description' or 'notional_mm'.",
+                })
+            c = classify_position(desc)
+            classified.append({
+                "description": desc,
+                "notional_mm": notional,
+                "hqla_level": c["level"],
+                "confidence": c["confidence"],
+                "matched_category": c["matched_category"],
+                "rationale": c["rationale"],
+            })
+            model_positions.append({"notional_mm": notional, "level": c["level"], **c["attributes"]})
+
+        include_lcr_nsfr = other_outflows_mm is not None and other_asf_mm is not None
+        result = _compute_from_positions(
+            model_positions,
+            other_outflows_mm or 0.0,
+            other_asf_mm or 0.0,
+            include_lcr_nsfr=include_lcr_nsfr,
+        )
+
+        by_level_mm = {}
+        for p in classified:
+            by_level_mm[p["hqla_level"]] = by_level_mm.get(p["hqla_level"], 0.0) + p["notional_mm"]
+
+        confidence_counts = {}
+        for p in classified:
+            confidence_counts[p["confidence"]] = confidence_counts.get(p["confidence"], 0) + 1
+
+        response = {
+            "positions_classified": classified,
+            "by_level_mm": {k: round(v, 1) for k, v in by_level_mm.items()},
+            "confidence_summary": confidence_counts,
+            "aggregate": result,
+            "methodology_note": "Illustrative classification tool. 'exact_match' positions use "
+                                 "precise regulatory factors from Aeonic's known asset universe; "
+                                 "'heuristic' and 'unclassified' positions use generic default "
+                                 "assumptions and need manual review before being relied upon. "
+                                 "This does not replace your own regulatory reporting process.",
+        }
+        if not include_lcr_nsfr:
+            response["lcr_nsfr_note"] = (
+                "LCR and NSFR were not computed because other_outflows_mm and/or other_asf_mm "
+                "were not provided -- these firm-wide figures can't be derived from a position "
+                "list alone. Provide both to get LCR/NSFR for this portfolio."
+            )
+        return json.dumps(response, indent=2)
