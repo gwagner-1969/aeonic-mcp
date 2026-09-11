@@ -200,7 +200,10 @@ async def chat(request: Request) -> JSONResponse:
         "result as if it were an exact match. If they haven't given you their firm-wide net "
         "cash outflows and available stable funding, report HQLA/RWA/capital and tell them "
         "what two additional figures would be needed for LCR/NSFR -- don't compute those "
-        "ratios without them."
+        "ratios without them. classify_portfolio never returns a funding cost figure for real "
+        "portfolios (by design -- it would require the client's own borrowing rates, which "
+        "aren't inferrable from regulatory parameters); proactively mention this limitation up "
+        "front rather than waiting to be asked, the same way you handle the LCR/NSFR caveat."
     )
 
     try:
