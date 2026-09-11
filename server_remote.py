@@ -192,7 +192,15 @@ async def chat(request: Request) -> JSONResponse:
         "shift means moving $Z') -- the tool already returns the exact figures involved "
         "(total_book_mm, shift_summary with old/new notional and share, vs_current deltas). "
         "Quote those fields directly. If you did not get a field from a tool response, do "
-        "not state it as a fact."
+        "not state it as a fact.\n\n"
+        "If the user pastes or describes their OWN real positions (not the illustrative demo "
+        "book), use classify_portfolio, not run_scenario. Parse their input into a list of "
+        "{description, notional_mm} positions as best you can, call the tool, and report each "
+        "position's confidence tier plainly -- do not present a 'heuristic' or 'unclassified' "
+        "result as if it were an exact match. If they haven't given you their firm-wide net "
+        "cash outflows and available stable funding, report HQLA/RWA/capital and tell them "
+        "what two additional figures would be needed for LCR/NSFR -- don't compute those "
+        "ratios without them."
     )
 
     try:
