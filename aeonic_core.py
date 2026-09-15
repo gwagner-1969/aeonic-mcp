@@ -179,6 +179,31 @@ def outflow_factor(level: str) -> float:
     return {"Level 1": 0.00, "Level 2A": 0.15, "Level 2B": 0.25}.get(level, 1.00)
 
 
+def sft_lend_rsf(hqla_level: str, lend_tenor: str) -> float:
+    """RSF for the LEND leg of a matched-book / SFT-style financing position -- a simplified
+    approximation of Basel's short-residual-maturity secured-lending treatment.
+
+    This is deliberately DIFFERENT from an asset's generic held-position RSF weight. A security
+    lent out for 90 days is a 90-day secured loan to a counterparty, not a year-long holding of
+    that asset type -- Basel's real SFT rules grade RSF by the LOAN's own tenor and whether it's
+    backed by Level 1 HQLA collateral, not by how illiquid the underlying normally is when held
+    outright. This does NOT replicate every nuance of BCBS 295 (counterparty-type distinctions,
+    specific netting rules, jurisdictional variations) -- it's a directionally-correct, stated
+    simplification, same discipline as the rest of this model.
+
+    Short tenor + Level 1 HQLA collateral -> lowest (preferential) RSF.
+    Short tenor + anything else -> a higher but still short-term-appropriate RSF.
+    Longer tenors converge toward full RSF, since a long-dated lend is economically closer to an
+    outright holding regardless of collateral quality.
+    """
+    short_tenors = ("O/N", "1M", "3M")
+    if lend_tenor in short_tenors:
+        return 0.10 if hqla_level == "Level 1" else 0.15
+    if lend_tenor == "6M":
+        return 0.50
+    return 1.00  # 1Y, 2Y+: treat as effectively a full-tenor holding
+
+
 def _compute_from_positions(positions: list[dict], other_outflows_mm: float, other_asf_mm: float,
                              include_lcr_nsfr: bool = True) -> dict:
     """Core engine, generalized to any list of positions (not just the fixed 9-asset book).
@@ -634,17 +659,21 @@ def register_tools(mcp) -> None:
 
                 MATCHED-BOOK TREATMENT (a real, deliberate simplification -- state this to the
                 user, don't present it as a precise regulatory determination): the security is
-                NOT counted toward HQLA stock or RWA (the client doesn't own it). It DOES generate
-                an RSF requirement based on the security's own asset-type RSF weight (the
-                obligation to deliver it back at the end of the lend leg is a real funding
-                commitment regardless of ownership), offset by whatever ASF credit the borrow
-                leg's tenor provides (typically ~0% for an overnight borrow). Borrowing short and
-                lending long therefore shows up correctly as an NSFR drag -- the classic
-                maturity-transformation risk of this kind of trade. NOT modeled in this
-                simplification, and you must say so if asked: LCR cash-flow/collateral treatment
-                of the securities financing legs, and counterparty credit RWA on the SFT exposure
-                itself (both are real capital considerations for repo/sec-lending books that this
-                tool does not attempt to represent).
+                NOT counted toward HQLA stock or RWA (the client doesn't own it). RSF on the LEND
+                leg is graded by the lend tenor and collateral quality -- short-tenor lending
+                backed by Level 1 HQLA gets preferential (lower) RSF, longer tenors converge
+                toward full RSF -- NOT the asset's generic held-position RSF weight (a 90-day loan
+                is a 90-day loan, not a year of holding that asset type). ASF on the BORROW leg is
+                graded by the borrow tenor the same way held positions are (short borrow ~0% ASF,
+                longer borrow more). Tenor and direction both matter: borrowing short to fund a
+                longer lend commitment shows up as an NSFR drag (maturity transformation risk);
+                borrowing long to fund a short lend commitment can actually improve NSFR. NOT
+                modeled in this simplification, and you must say so if asked: LCR cash-flow/
+                collateral treatment of the financing legs, and counterparty credit RWA on the SFT
+                exposure itself (both are real capital considerations this tool does not attempt
+                to represent). This also does not replicate every nuance of the real Basel SFT
+                rules (counterparty-type distinctions, specific netting rules, jurisdictional
+                variations) -- it's a directionally-correct approximation, not a precise one.
 
             other_outflows_mm / other_asf_mm: OPTIONAL real firm-wide figures (see below).
 
@@ -711,7 +740,8 @@ def register_tools(mcp) -> None:
                              f"each be one of {list(TENORS.keys())}.",
                 })
             c = classify_position(desc)
-            rsf_contribution = notional * c["attributes"]["rsf"]
+            lend_rsf_rate = sft_lend_rsf(c["level"], lend_tenor)
+            rsf_contribution = notional * lend_rsf_rate
             asf_contribution = notional * TENORS[borrow_tenor]["asf"]
             net_nsfr_drag = rsf_contribution - asf_contribution
             financing_classified.append({
@@ -720,6 +750,8 @@ def register_tools(mcp) -> None:
                 "structure": "matched_book",
                 "borrow_tenor": borrow_tenor,
                 "lend_tenor": lend_tenor,
+                "lend_leg_rsf_rate": lend_rsf_rate,
+                "borrow_leg_asf_rate": TENORS[borrow_tenor]["asf"],
                 "underlying_classification": {
                     "hqla_level": c["level"], "confidence": c["confidence"],
                     "matched_category": c["matched_category"],
@@ -729,12 +761,16 @@ def register_tools(mcp) -> None:
                 "rsf_from_lend_commitment_mm": round(rsf_contribution, 1),
                 "asf_credit_from_borrow_mm": round(asf_contribution, 1),
                 "net_nsfr_drag_mm": round(net_nsfr_drag, 1),
-                "note": "Not counted toward HQLA or RWA (not owned outright). The lend-leg "
-                        "commitment still requires stable funding (rsf_from_lend_commitment_mm); "
-                        "the borrow leg only credits asf_credit_from_borrow_mm of that back. A "
-                        "positive net_nsfr_drag_mm means this trade consumes stable funding "
-                        "capacity -- larger when the lend tenor is longer than the borrow tenor, "
-                        "exactly the maturity-transformation risk of this kind of structure.",
+                "note": "Not counted toward HQLA or RWA (not owned outright). RSF on the lend leg "
+                        "is graded by the LEND tenor and collateral quality (lend_leg_rsf_rate) -- "
+                        "short-tenor, Level-1-HQLA-backed lending gets preferential (lower) RSF, "
+                        "longer tenors converge toward full RSF -- a simplified approximation of "
+                        "Basel's short-residual-maturity SFT treatment, not the asset's generic "
+                        "held-position RSF weight. ASF on the borrow leg (borrow_leg_asf_rate) is "
+                        "graded by the BORROW tenor the same way held positions are. A positive "
+                        "net_nsfr_drag_mm means this trade consumes stable funding capacity; "
+                        "borrowing short to fund a longer lend commitment is unfavorable, while "
+                        "borrowing long to fund a short lend commitment can actually improve NSFR.",
             })
 
         total_book = sum(p["notional_mm"] for p in positions)
