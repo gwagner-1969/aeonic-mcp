@@ -163,9 +163,9 @@ LIVE_SLUGS = [
     {"slug": "blackrock-buidl", "symbol": "BUIDL", "name": "BlackRock BUIDL"},
     {"slug": "circle-usyc", "symbol": "USYC", "name": "Circle USYC (formerly Hashnote)"},
     {"slug": "ondo-yield-assets", "symbol": "USDY", "name": "Ondo Yield Assets (OUSG/USDY)"},
-    {"slug": "spiko", "symbol": "USTBL", "name": "Spiko (USTBL/EUTBL)"},
+    {"slug": "spiko", "symbol": "USTBL", "name": "Spiko"},
     {"slug": "centrifuge-protocol", "symbol": "CFG", "name": "Centrifuge Protocol"},
-    {"slug": "wisdomtree", "symbol": "WTGXX", "name": "WisdomTree (WTGXX)"},
+    {"slug": "wisdomtree", "symbol": "WTGXX", "name": "WisdomTree Connect"},
 ]
 
 USTB_TOKEN = "0x43415eB6ff9DB7E26A15b704e7A3eDCe97d31C4e"
@@ -395,6 +395,27 @@ def get_ustb_live_aum() -> float:
     return (supply * price) / 1e6
 
 
+def _fetch_protocol_tvl_mm(slug: str) -> Optional[float]:
+    """Current value in $mm for a DefiLlama protocol slug, via the per-protocol /tvl endpoint.
+    Returns None if DefiLlama reports no positive value. Raises on network/HTTP errors so the
+    caller can record them.
+
+    Scope note: for these RWA platforms the figure covers ALL of the issuer's funds on the
+    platform, not one token (DefiLlama's Spiko page labels its equivalent figure "RWA AUM",
+    $2.584bn on its page vs $2.625bn from this endpoint, checked 2026-09-18; the 'wisdomtree'
+    slug is WisdomTree Connect, the whole platform).
+
+    Why this exists: DefiLlama's bulk /protocols list returns tvl=None for RWA-category entries,
+    even though the slugs are valid (spiko, centrifuge-protocol and wisdomtree were confirmed
+    this way on 2026-09-18), so the bulk lookup alone cannot produce a number for them."""
+    resp = httpx.get(f"https://api.llama.fi/tvl/{slug}", timeout=10.0)
+    resp.raise_for_status()
+    value = resp.json()
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return round(value / 1e6, 1)
+    return None
+
+
 # =====================================================================
 # Tool registration — call this once against any MCPServer instance
 # =====================================================================
@@ -592,11 +613,34 @@ def get_live_collateral_inventory_impl() -> dict:
                 "status": "Live",
             })
             continue
+        if proto is not None:
+            # Slug is valid but the bulk list carries no TVL (RWA-category entries). Try the
+            # per-protocol endpoint before giving up.
+            try:
+                tvl_mm = _fetch_protocol_tvl_mm(entry["slug"])
+            except Exception as e:
+                tvl_mm = None
+                errors.append(f"DefiLlama /tvl/{entry['slug']} fetch failed: {e}")
+            if tvl_mm:
+                results.append({
+                    "asset": entry["name"],
+                    "source": "DefiLlama live API (protocol endpoint, all funds)",
+                    "tvl_aum_mm": tvl_mm,
+                    "status": "Live",
+                })
+                continue
+            results.append({
+                "asset": entry["name"],
+                "source": "DefiLlama live API",
+                "tvl_aum_mm": None,
+                "status": "Listed on DefiLlama; no value from its free API",
+            })
+            continue
         results.append({
             "asset": entry["name"],
             "source": "DefiLlama live API",
             "tvl_aum_mm": None,
-            "status": "No match in either DefiLlama registry",
+            "status": "Not found in DefiLlama's free API registries",
         })
 
     ustb_result = {"asset": "Superstate USTB", "source": "Direct on-chain (Ethereum RPC + Chainlink oracle)"}
