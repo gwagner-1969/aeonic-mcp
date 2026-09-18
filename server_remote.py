@@ -42,15 +42,29 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from aeonic_core import register_tools
+from aeonic_core import (
+    register_tools,
+    get_asset_universe_impl, run_scenario_impl, classify_asset_impl,
+    lookup_identifier_impl, list_sources_impl, get_live_collateral_inventory_impl,
+    classify_portfolio_impl,
+)
 
 API_KEY = os.environ.get("AEONIC_MCP_API_KEY")  # None => authless PoC mode
+
+# --- REST API (v1) config -- a separate, deliberately simple concern from the MCP/chat auth
+# above. One or more comma-separated keys; each request must send one in the 'apikey' header
+# (same convention as SonarX's public API -- a familiar pattern for anyone integrating).
+# Empty/unset REST_API_KEYS means the REST API is not exposed at all (routes 404), rather than
+# silently running authless -- unlike the MCP server, these routes are meant for real
+# institutional integration, not casual public access, so there's no "authless PoC mode" here.
+REST_API_KEYS = {k.strip() for k in os.environ.get("REST_API_KEYS", "").split(",") if k.strip()}
+REST_RATE_LIMIT_PER_HOUR = int(os.environ.get("REST_RATE_LIMIT_PER_HOUR", "120"))
 
 # --- Chat widget config (new) ---
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # required only for /chat
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-haiku-4-5-20251001")
 CHAT_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
-    "CHAT_ALLOWED_ORIGINS", "https://aeonic.vc"
+    "CHAT_ALLOWED_ORIGINS", "https://aeonic.vc,https://aeonic.digital"
 ).split(",") if o.strip()]
 MAX_MESSAGE_CHARS = 800
 MAX_HISTORY_TURNS = 6  # user+assistant pairs kept from client-supplied history
@@ -84,18 +98,29 @@ mcp = MCPServer("aeonic-digital-collateral")
 register_tools(mcp)
 
 _rate_limit_buckets: dict[str, deque] = defaultdict(deque)
+_rest_rate_limit_buckets: dict[str, deque] = defaultdict(deque)
 
 
-def _check_rate_limit(client_ip: str) -> bool:
-    """Simple sliding-window limiter. Returns True if the request is allowed."""
+def _check_rate_limit(client_ip: str, buckets: dict[str, deque] = None, limit: int = None) -> bool:
+    """Simple sliding-window limiter. Returns True if the request is allowed. Defaults to the
+    chat's own bucket/limit; pass buckets/limit explicitly for a separate namespace (e.g. REST)."""
+    buckets = _rate_limit_buckets if buckets is None else buckets
+    limit = RATE_LIMIT_PER_HOUR if limit is None else limit
     now = time.time()
-    bucket = _rate_limit_buckets[client_ip]
+    bucket = buckets[client_ip]
     while bucket and now - bucket[0] > 3600:
         bucket.popleft()
-    if len(bucket) >= RATE_LIMIT_PER_HOUR:
+    if len(bucket) >= limit:
         return False
     bucket.append(now)
     return True
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
@@ -133,10 +158,7 @@ async def chat(request: Request) -> JSONResponse:
             status_code=503,
         )
 
-    client_ip = request.client.host if request.client else "unknown"
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
+    client_ip = _client_ip(request)
     if not _check_rate_limit(client_ip):
         return JSONResponse(
             {"error": "Rate limit reached. Please try again later."},
@@ -253,6 +275,241 @@ async def chat(request: Request) -> JSONResponse:
     return JSONResponse({"answer": answer})
 
 
+# =====================================================================
+# REST API v1 -- plain JSON in/out, no LLM in the loop. Same underlying logic as the MCP
+# tools and the chat widget (both call the identical *_impl functions in aeonic_core.py),
+# reached with a normal HTTP request instead of a natural-language question. Meant for a
+# bank's or partner's own systems to call directly -- batch jobs, their own dashboards,
+# anything that wants deterministic, fast, structured access without an LLM round-trip.
+#
+# Namespaced under /api/v1/capital/... deliberately, even though it's the only module today
+# -- /api/v1/risk/..., /api/v1/wallet/..., /api/v1/collateral/... are reserved for future
+# modules, so adding one later never requires restructuring or breaking this one.
+# =====================================================================
+
+def _rest_auth_and_rate_limit(request: Request):
+    """Returns None if the request may proceed, or a JSONResponse to return immediately."""
+    if not REST_API_KEYS:
+        return JSONResponse(
+            {"error": "The REST API is not enabled on this server (no REST_API_KEYS configured)."},
+            status_code=503,
+        )
+    key = request.headers.get("apikey", "")
+    if key not in REST_API_KEYS:
+        return JSONResponse({"error": "Missing or invalid API key. Send it in the 'apikey' header."}, status_code=401)
+    if not _check_rate_limit(_client_ip(request), _rest_rate_limit_buckets, REST_RATE_LIMIT_PER_HOUR):
+        return JSONResponse({"error": "Rate limit reached. Please try again later."}, status_code=429)
+    return None
+
+
+async def _rest_json_body(request: Request):
+    """Returns (body_dict, None) or (None, JSONResponse) on a parse error."""
+    if not await request.body():
+        return {}, None
+    try:
+        return await request.json(), None
+    except Exception:
+        return None, JSONResponse({"error": "Invalid JSON body."}, status_code=400)
+
+
+async def rest_asset_universe(request: Request) -> JSONResponse:
+    denied = _rest_auth_and_rate_limit(request)
+    if denied:
+        return denied
+    return JSONResponse({"assets": get_asset_universe_impl()})
+
+
+async def rest_sources(request: Request) -> JSONResponse:
+    denied = _rest_auth_and_rate_limit(request)
+    if denied:
+        return denied
+    status_filter = request.query_params.get("status")
+    return JSONResponse({"sources": list_sources_impl(status_filter)})
+
+
+async def rest_lookup_identifier(request: Request) -> JSONResponse:
+    denied = _rest_auth_and_rate_limit(request)
+    if denied:
+        return denied
+    asset_name = request.query_params.get("asset_name", "")
+    if not asset_name:
+        return JSONResponse({"error": "Missing required query parameter 'asset_name'."}, status_code=400)
+    return JSONResponse(lookup_identifier_impl(asset_name))
+
+
+async def rest_live_inventory(request: Request) -> JSONResponse:
+    denied = _rest_auth_and_rate_limit(request)
+    if denied:
+        return denied
+    return JSONResponse(get_live_collateral_inventory_impl())
+
+
+async def rest_classify_asset(request: Request) -> JSONResponse:
+    denied = _rest_auth_and_rate_limit(request)
+    if denied:
+        return denied
+    body, err = await _rest_json_body(request)
+    if err:
+        return err
+    required = ("has_traditional_id", "is_direct_beneficial_ownership")
+    missing = [k for k in required if k not in body]
+    if missing:
+        return JSONResponse({"error": f"Missing required field(s): {', '.join(missing)}."}, status_code=400)
+    return JSONResponse(classify_asset_impl(
+        has_traditional_id=body["has_traditional_id"],
+        is_direct_beneficial_ownership=body["is_direct_beneficial_ownership"],
+        venue_recognizes_as_collateral=body.get("venue_recognizes_as_collateral", True),
+        underlying_security_type=body.get("underlying_security_type"),
+    ))
+
+
+async def rest_run_scenario(request: Request) -> JSONResponse:
+    denied = _rest_auth_and_rate_limit(request)
+    if denied:
+        return denied
+    body, err = await _rest_json_body(request)
+    if err:
+        return err
+    result = run_scenario_impl(
+        allocation=body.get("allocation"),
+        preset=body.get("preset"),
+        shift_into=body.get("shift_into"),
+        shift_pct=body.get("shift_pct"),
+    )
+    status = 400 if "error" in result else 200
+    return JSONResponse(result, status_code=status)
+
+
+async def rest_classify_portfolio(request: Request) -> JSONResponse:
+    denied = _rest_auth_and_rate_limit(request)
+    if denied:
+        return denied
+    body, err = await _rest_json_body(request)
+    if err:
+        return err
+    result = classify_portfolio_impl(
+        positions=body.get("positions"),
+        financing_positions=body.get("financing_positions"),
+        other_outflows_mm=body.get("other_outflows_mm"),
+        other_asf_mm=body.get("other_asf_mm"),
+    )
+    status = 400 if "error" in result else 200
+    return JSONResponse(result, status_code=status)
+
+
+# Hand-written OpenAPI 3.0 spec -- Starlette (unlike FastAPI) doesn't generate this
+# automatically, so it's maintained by hand here. Keep this in sync whenever a route above
+# changes shape.
+OPENAPI_SPEC = {
+    "openapi": "3.0.3",
+    "info": {
+        "title": "Aeonic Digital Capital & Liquidity API",
+        "version": "1.0.0",
+        "description": "Regulatory classification and capital/liquidity modeling for traditional "
+                        "and tokenized assets. Same underlying logic as the Aeonic Digital chat "
+                        "widget, reached via plain JSON instead of natural language.",
+    },
+    "servers": [{"url": f"https://{ALLOWED_HOSTS[0]}"}],
+    "components": {
+        "securitySchemes": {
+            "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "apikey"}
+        }
+    },
+    "security": [{"ApiKeyAuth": []}],
+    "paths": {
+        "/api/v1/capital/asset-universe": {
+            "get": {
+                "summary": "The full asset universe (HQLA level, haircut, RSF, risk weight, tenor per asset class)",
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/api/v1/capital/sources": {
+            "get": {
+                "summary": "Digital collateral data sources and their connectivity status",
+                "parameters": [{"name": "status", "in": "query", "required": False,
+                                 "schema": {"type": "string"}, "description": "Filter, e.g. 'Live'"}],
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/api/v1/capital/lookup-identifier": {
+            "get": {
+                "summary": "Identifier crosswalk (ISIN/CUSIP, digital DTI, network) for a named asset",
+                "parameters": [{"name": "asset_name", "in": "query", "required": True,
+                                 "schema": {"type": "string"}}],
+                "responses": {"200": {"description": "OK"}, "400": {"description": "Missing asset_name"}},
+            }
+        },
+        "/api/v1/capital/live-inventory": {
+            "get": {
+                "summary": "Live AUM/TVL for tokenized collateral products (DefiLlama + on-chain)",
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/api/v1/capital/classify-asset": {
+            "post": {
+                "summary": "5-step HQLA classification decision chain for a single asset",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["has_traditional_id", "is_direct_beneficial_ownership"],
+                    "properties": {
+                        "has_traditional_id": {"type": "boolean"},
+                        "is_direct_beneficial_ownership": {"type": "boolean"},
+                        "venue_recognizes_as_collateral": {"type": "boolean", "default": True},
+                        "underlying_security_type": {"type": "string"},
+                    },
+                }}}},
+                "responses": {"200": {"description": "OK"}, "400": {"description": "Missing required field(s)"}},
+            }
+        },
+        "/api/v1/capital/run-scenario": {
+            "post": {
+                "summary": "LCR/NSFR/capital/funding-cost model on the illustrative demo book. "
+                           "Provide exactly one of: preset, (shift_into + shift_pct), or allocation.",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "properties": {
+                        "preset": {"type": "string", "enum": ["current", "scenario_a", "scenario_b"]},
+                        "shift_into": {"type": "string", "description": "Exact asset class name"},
+                        "shift_pct": {"type": "number"},
+                        "allocation": {"type": "object", "description": "Asset name -> pct of book, all 9, summing to 100"},
+                    },
+                }}}},
+                "responses": {"200": {"description": "OK"}, "400": {"description": "Invalid scenario spec"}},
+            }
+        },
+        "/api/v1/capital/classify-portfolio": {
+            "post": {
+                "summary": "Classify a real client portfolio into HQLA levels; compute HQLA stock, "
+                           "RWA, capital required, LCR, and NSFR. Supports held positions and "
+                           "matched-book financing positions.",
+                "requestBody": {"required": True, "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "properties": {
+                        "positions": {"type": "array", "items": {"type": "object", "properties": {
+                            "description": {"type": "string"}, "notional_mm": {"type": "number"},
+                            "funding_tenor": {"type": "string", "enum": ["O/N", "1M", "3M", "6M", "1Y", "2Y+"]},
+                        }}},
+                        "financing_positions": {"type": "array", "items": {"type": "object", "properties": {
+                            "description": {"type": "string"}, "notional_mm": {"type": "number"},
+                            "structure": {"type": "string", "enum": ["matched_book"]},
+                            "borrow_tenor": {"type": "string", "enum": ["O/N", "1M", "3M", "6M", "1Y", "2Y+"]},
+                            "lend_tenor": {"type": "string", "enum": ["O/N", "1M", "3M", "6M", "1Y", "2Y+"]},
+                        }}},
+                        "other_outflows_mm": {"type": "number", "description": "Real firm-wide figure, optional"},
+                        "other_asf_mm": {"type": "number", "description": "Real firm-wide figure, optional"},
+                    },
+                }}}},
+                "responses": {"200": {"description": "OK"}, "400": {"description": "Invalid position data"}},
+            }
+        },
+    },
+}
+
+
+async def rest_openapi_spec(request: Request) -> JSONResponse:
+    return JSONResponse(OPENAPI_SPEC)
+
+
 def build_app() -> Starlette:
     mcp_app = mcp.streamable_http_app(stateless_http=True, transport_security=TRANSPORT_SECURITY)
     mcp_app.add_middleware(ApiKeyMiddleware)
@@ -264,6 +521,20 @@ def build_app() -> Starlette:
     )
     mcp_app.router.routes.append(Route("/health", health, methods=["GET"]))
     mcp_app.router.routes.append(Route("/chat", chat, methods=["POST"]))
+
+    # REST API v1 -- registered here since Starlette routes aren't picked up just by being
+    # defined as functions; they have to be explicitly added to the router like /health and
+    # /chat above. (Confirmed this was missing: none of the seven routes below, or the spec
+    # endpoint, were actually reachable until this fix -- everything below 404'd despite the
+    # OpenAPI spec describing it as live.)
+    mcp_app.router.routes.append(Route("/api/v1/capital/asset-universe", rest_asset_universe, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/sources", rest_sources, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/lookup-identifier", rest_lookup_identifier, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/live-inventory", rest_live_inventory, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/classify-asset", rest_classify_asset, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/run-scenario", rest_run_scenario, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/classify-portfolio", rest_classify_portfolio, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/api/v1/openapi.json", rest_openapi_spec, methods=["GET"]))
     return mcp_app
 
 
