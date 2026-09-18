@@ -73,6 +73,13 @@ CONST = {
     "other_asf": 800.0,
 }
 
+# Illustrative-default assumptions for firm-wide LCR/NSFR inputs on REAL client portfolios
+# (classify_portfolio), used only when the caller doesn't supply their own real figures.
+# Defined once, here, as named constants -- not improvised per-conversation -- so the
+# numbers are reproducible and the tool's own JSON output states exactly what was assumed.
+ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK = 0.25   # planning-level assumption, not derived from data
+ILLUSTRATIVE_ASF_PCT_OF_BOOK = 1.00       # planning-level assumption, not derived from data
+
 PRESETS = {
     "current": [0.025, 0.20, 0.05, 0.15, 0.125, 0.10, 0.025, 0.075, 0.25],
     "scenario_a": [0.025, 0.15, 0.10, 0.15, 0.125, 0.075, 0.05, 0.075, 0.25],
@@ -152,14 +159,14 @@ SOURCES = [
      "status": "Already standard practice"},
 ]
 
-LIVE_SLUGS = {
-    "blackrock-buidl": "BlackRock BUIDL",
-    "circle-usyc": "Circle USYC (formerly Hashnote)",
-    "ondo-yield-assets": "Ondo Yield Assets (OUSG/USDY)",
-    "spiko": "Spiko (USTBL/EUTBL)",
-    "centrifuge-protocol": "Centrifuge Protocol",
-    "wisdomtree": "WisdomTree (WTGXX)",
-}
+LIVE_SLUGS = [
+    {"slug": "blackrock-buidl", "symbol": "BUIDL", "name": "BlackRock BUIDL"},
+    {"slug": "circle-usyc", "symbol": "USYC", "name": "Circle USYC (formerly Hashnote)"},
+    {"slug": "ondo-yield-assets", "symbol": "USDY", "name": "Ondo Yield Assets (OUSG/USDY)"},
+    {"slug": "spiko", "symbol": "USTBL", "name": "Spiko (USTBL/EUTBL)"},
+    {"slug": "centrifuge-protocol", "symbol": "CFG", "name": "Centrifuge Protocol"},
+    {"slug": "wisdomtree", "symbol": "WTGXX", "name": "WisdomTree (WTGXX)"},
+]
 
 USTB_TOKEN = "0x43415eB6ff9DB7E26A15b704e7A3eDCe97d31C4e"
 USTB_ORACLE = "0x289B5036cd942e619E1Ee48670F98d214E745AAC"
@@ -392,15 +399,418 @@ def get_ustb_live_aum() -> float:
 # Tool registration — call this once against any MCPServer instance
 # =====================================================================
 
+def get_asset_universe_impl() -> list:
+    """Standalone logic for get_asset_universe -- see the MCP tool docstring in register_tools
+    for the full description. Returns the raw ASSETS list directly."""
+    return ASSETS
+
+
+def run_scenario_impl(allocation: Optional[dict[str, float]] = None, preset: Optional[str] = None,
+                       shift_into: Optional[str] = None, shift_pct: Optional[float] = None) -> dict:
+    """Standalone logic for run_scenario -- see the MCP tool docstring in register_tools for the
+    full description of preset / shift_into+shift_pct / allocation."""
+    if preset:
+        if preset not in PRESETS:
+            return {"error": f"Unknown preset '{preset}'. Use one of: {list(PRESETS.keys())}"}
+        alloc = PRESETS[preset]
+        shift_summary = None
+    elif shift_into is not None and shift_pct is not None:
+        if shift_into not in ASSET_NAMES:
+            return {
+                "error": f"Unknown asset class '{shift_into}'.",
+                "valid_asset_classes": ASSET_NAMES,
+            }
+        idx = ASSET_NAMES.index(shift_into)
+        base = PRESETS["current"]
+        s = shift_pct / 100.0
+        cur_i = base[idx]
+        denom = 1.0 - cur_i
+        if s < 0 or s > denom + 1e-9:
+            return {
+                "error": f"Cannot shift {shift_pct} points into '{shift_into}': only "
+                         f"{denom*100:.1f} percentage points are available to move from other "
+                         f"asset classes (current share of '{shift_into}' is {cur_i*100:.1f}%).",
+            }
+        scale = (1 - s / denom) if denom > 1e-9 else 0.0
+        alloc = [
+            (cur_i + s) if j == idx else base[j] * scale
+            for j in range(len(ASSET_NAMES))
+        ]
+        shift_summary = {
+            "asset": shift_into,
+            "shift_pct_requested": shift_pct,
+            "old_share_pct": round(cur_i * 100, 2),
+            "new_share_pct": round((cur_i + s) * 100, 2),
+            "old_notional_mm": round(cur_i * CONST["total_book"], 1),
+            "new_notional_mm": round((cur_i + s) * CONST["total_book"], 1),
+            "notional_added_mm": round(s * CONST["total_book"], 1),
+        }
+    elif allocation:
+        alloc = [allocation.get(name, 0.0) / 100.0 for name in ASSET_NAMES]
+        total = sum(alloc)
+        if abs(total - 1.0) > 0.01:
+            return {
+                "error": f"Allocation sums to {total*100:.1f}%, not 100%. "
+                         f"Provide percentages for all asset classes summing to 100.",
+                "valid_asset_classes": ASSET_NAMES,
+            }
+        shift_summary = None
+    else:
+        return {
+            "error": "Provide 'preset', or 'shift_into'+'shift_pct', or a full 'allocation'.",
+            "valid_presets": list(PRESETS.keys()),
+            "valid_asset_classes": ASSET_NAMES,
+        }
+
+    result = compute_metrics(alloc)
+    capital_released = CURRENT_METRICS["capital_required_mm"] - result["capital_required_mm"]
+    funding_savings = CURRENT_METRICS["annual_funding_cost_mm"] - result["annual_funding_cost_mm"]
+    net_value = capital_released * CONST["return_on_capital"] + funding_savings
+
+    response = {
+        "result": result,
+        "vs_current": {
+            "lcr_current": CURRENT_METRICS["lcr"],
+            "nsfr_current": CURRENT_METRICS["nsfr"],
+            "capital_released_mm": round(capital_released, 2),
+            "annual_funding_savings_mm": round(funding_savings, 2),
+            "net_value_created_mm_per_year": round(net_value, 2),
+        },
+        "methodology_note": "Illustrative demonstration model with representative sample data. "
+                             "Regulatory factors are simplified approximations of Basel III, not a "
+                             "production regulatory-reporting engine.",
+    }
+    if shift_summary:
+        response["shift_summary"] = shift_summary
+    return response
+
+
+def classify_asset_impl(has_traditional_id: bool, is_direct_beneficial_ownership: bool,
+                         venue_recognizes_as_collateral: bool = True,
+                         underlying_security_type: Optional[str] = None) -> dict:
+    """Standalone logic for classify_asset -- see the MCP tool docstring in register_tools for
+    the full description of the 5-step decision chain."""
+    if not is_direct_beneficial_ownership:
+        return {
+            "hqla_level": "Not HQLA (ineligible)",
+            "step": 3,
+            "rationale": "Wrapped or synthetic exposure that only tracks price, without a direct "
+                         "registered claim on the underlying asset, is ineligible regardless of "
+                         "what it tracks.",
+        }
+
+    if has_traditional_id:
+        level = "Driven by the underlying security's own Basel classification (see get_asset_universe)"
+        step = 1
+        rationale = (f"An ISIN/CUSIP is present, so classification follows the underlying "
+                     f"security's own type and issuer{' (' + underlying_security_type + ')' if underlying_security_type else ''} "
+                     f"— never the technology wrapper.")
+    else:
+        level = "Not HQLA (default)"
+        step = 2
+        rationale = ("No traditional ID exists — this is a native token. Default treatment under "
+                     "Basel is Not HQLA unless a jurisdiction-specific crypto-asset capital "
+                     "treatment applies; don't assume an override without confirming it.")
+
+    result = {"hqla_level": level, "step": step, "rationale": rationale}
+    if not venue_recognizes_as_collateral:
+        result["caveat"] = ("Venue-recognition gap flagged: the venue itself does not yet recognize "
+                             "its own tokenized issuance as collateral internally, even though the "
+                             "security's own HQLA eligibility (above) is unaffected.")
+    return result
+
+
+def lookup_identifier_impl(asset_name: str):
+    """Standalone logic for lookup_identifier. Returns a list of matches, or a dict with an
+    'error' key if nothing matched -- same shape the MCP tool has always returned."""
+    q = asset_name.strip().lower()
+    matches = [row for row in CROSSWALK if q in row["asset"].lower()]
+    if not matches:
+        return {
+            "error": f"No match for '{asset_name}'.",
+            "available_assets": [row["asset"] for row in CROSSWALK],
+        }
+    return matches
+
+
+def list_sources_impl(status_filter: Optional[str] = None):
+    """Standalone logic for list_sources. Returns a bare list, same shape the MCP tool has
+    always returned."""
+    rows = SOURCES
+    if status_filter:
+        rows = [r for r in rows if status_filter.lower() in r["status"].lower()]
+    return rows
+
+
+def get_live_collateral_inventory_impl() -> dict:
+    """Standalone logic for get_live_collateral_inventory.
+
+    FIX applied during the REST-API extraction (2026): the original version only checked
+    DefiLlama's /protocols (TVL) registry by slug. BUIDL, USYC, Ondo's yield token, Spiko,
+    Centrifuge, and WisdomTree are fund-style tokens DefiLlama tracks in a SEPARATE stablecoins
+    registry, not as TVL "protocols" -- the old slug-only lookup was silently returning null for
+    most of these. Now checks the stablecoins registry (by symbol) first, since that's where each
+    fund's real AUM actually lives, falling back to /protocols only if no stablecoins match exists.
+    This is the same fix already applied to the client-side JS widget on the portfolio-analysis
+    page; the two had drifted since the JS fix predates this Python-side refactor.
+    """
+    results = []
+    errors = []
+
+    proto_by_slug = {}
+    stable_by_symbol = {}
+    try:
+        resp = httpx.get("https://api.llama.fi/protocols", timeout=15.0)
+        resp.raise_for_status()
+        proto_by_slug = {p["slug"]: p for p in resp.json()}
+    except Exception as e:
+        errors.append(f"DefiLlama /protocols fetch failed: {e}")
+
+    try:
+        resp = httpx.get("https://stablecoins.llama.fi/stablecoins?includePrices=true", timeout=15.0)
+        resp.raise_for_status()
+        stable_by_symbol = {s["symbol"].upper(): s for s in resp.json().get("peggedAssets", [])}
+    except Exception as e:
+        errors.append(f"DefiLlama /stablecoins fetch failed: {e}")
+
+    for entry in LIVE_SLUGS:
+        stable = stable_by_symbol.get(entry["symbol"].upper())
+        if stable and stable.get("circulating", {}).get("peggedUSD"):
+            results.append({
+                "asset": entry["name"],
+                "source": "DefiLlama live API (stablecoins)",
+                "tvl_aum_mm": round(stable["circulating"]["peggedUSD"] / 1e6, 1),
+                "status": "Live",
+            })
+            continue
+        proto = proto_by_slug.get(entry["slug"])
+        if proto and proto.get("tvl"):
+            results.append({
+                "asset": entry["name"],
+                "source": "DefiLlama live API (protocols)",
+                "tvl_aum_mm": round(proto["tvl"] / 1e6, 1),
+                "status": "Live",
+            })
+            continue
+        results.append({
+            "asset": entry["name"],
+            "source": "DefiLlama live API",
+            "tvl_aum_mm": None,
+            "status": "No match in either DefiLlama registry",
+        })
+
+    ustb_result = {"asset": "Superstate USTB", "source": "Direct on-chain (Ethereum RPC + Chainlink oracle)"}
+    try:
+        ustb_result["tvl_aum_mm"] = round(get_ustb_live_aum(), 1)
+        ustb_result["status"] = "Live — no data vendor"
+    except Exception as e:
+        ustb_result["tvl_aum_mm"] = None
+        ustb_result["status"] = f"On-chain query failed: {e}"
+    results.append(ustb_result)
+
+    return {"live_data": results, "errors": errors or None}
+
+
+def classify_portfolio_impl(positions: Optional[list[dict]] = None,
+                             financing_positions: Optional[list[dict]] = None,
+                             other_outflows_mm: Optional[float] = None,
+                             other_asf_mm: Optional[float] = None) -> dict:
+    """Standalone logic for classify_portfolio -- see the MCP tool docstring in register_tools
+    for the full description of positions / financing_positions / matched-book treatment."""
+    positions = positions or []
+    financing_positions = financing_positions or []
+    if not positions and not financing_positions:
+        return {"error": "Provide at least one position (held or financing)."}
+
+    classified = []
+    model_positions = []
+    for i, pos in enumerate(positions):
+        desc = pos.get("description", "")
+        notional = pos.get("notional_mm")
+        if not desc or notional is None:
+            return {"error": f"positions[{i}] is missing 'description' or 'notional_mm'."}
+        c = classify_position(desc)
+        attrs = dict(c["attributes"])
+        funding_tenor = pos.get("funding_tenor")
+        if funding_tenor:
+            if funding_tenor not in TENORS:
+                return {
+                    "error": f"positions[{i}]: unknown funding_tenor '{funding_tenor}'. "
+                             f"Use one of: {list(TENORS.keys())}",
+                }
+            attrs["tenor"] = funding_tenor
+        classified.append({
+            "description": desc,
+            "notional_mm": notional,
+            "hqla_level": c["level"],
+            "confidence": c["confidence"],
+            "matched_category": c["matched_category"],
+            "rationale": c["rationale"],
+            "funding_tenor_used": attrs["tenor"],
+        })
+        model_positions.append({"notional_mm": notional, "level": c["level"], **attrs})
+
+    financing_classified = []
+    for i, fp in enumerate(financing_positions):
+        desc = fp.get("description", "")
+        notional = fp.get("notional_mm")
+        structure = fp.get("structure")
+        if not desc or notional is None:
+            return {"error": f"financing_positions[{i}] is missing 'description' or 'notional_mm'."}
+        if structure != "matched_book":
+            return {
+                "error": f"financing_positions[{i}]: 'structure' must be 'matched_book' "
+                         f"(the only supported financing structure right now).",
+            }
+        borrow_tenor = fp.get("borrow_tenor")
+        lend_tenor = fp.get("lend_tenor")
+        if borrow_tenor not in TENORS or lend_tenor not in TENORS:
+            return {
+                "error": f"financing_positions[{i}]: 'borrow_tenor' and 'lend_tenor' must "
+                         f"each be one of {list(TENORS.keys())}.",
+            }
+        c = classify_position(desc)
+        lend_rsf_rate = sft_lend_rsf(c["level"], lend_tenor)
+        rsf_contribution = notional * lend_rsf_rate
+        asf_contribution = notional * TENORS[borrow_tenor]["asf"]
+        net_nsfr_drag = rsf_contribution - asf_contribution
+        financing_classified.append({
+            "description": desc,
+            "notional_mm": notional,
+            "structure": "matched_book",
+            "borrow_tenor": borrow_tenor,
+            "lend_tenor": lend_tenor,
+            "lend_leg_rsf_rate": lend_rsf_rate,
+            "borrow_leg_asf_rate": TENORS[borrow_tenor]["asf"],
+            "underlying_classification": {
+                "hqla_level": c["level"], "confidence": c["confidence"],
+                "matched_category": c["matched_category"],
+            },
+            "hqla_contribution_mm": 0.0,
+            "rwa_contribution_mm": 0.0,
+            "rsf_from_lend_commitment_mm": round(rsf_contribution, 1),
+            "asf_credit_from_borrow_mm": round(asf_contribution, 1),
+            "net_nsfr_drag_mm": round(net_nsfr_drag, 1),
+            "note": "Not counted toward HQLA or RWA (not owned outright). RSF on the lend leg "
+                    "is graded by the LEND tenor and collateral quality (lend_leg_rsf_rate) -- "
+                    "short-tenor, Level-1-HQLA-backed lending gets preferential (lower) RSF, "
+                    "longer tenors converge toward full RSF -- a simplified approximation of "
+                    "Basel's short-residual-maturity SFT treatment, not the asset's generic "
+                    "held-position RSF weight. ASF on the borrow leg (borrow_leg_asf_rate) is "
+                    "graded by the BORROW tenor the same way held positions are. A positive "
+                    "net_nsfr_drag_mm means this trade consumes stable funding capacity; "
+                    "borrowing short to fund a longer lend commitment is unfavorable, while "
+                    "borrowing long to fund a short lend commitment can actually improve NSFR.",
+        })
+
+    total_book = sum(p["notional_mm"] for p in positions)
+    client_provided = other_outflows_mm is not None and other_asf_mm is not None
+    if client_provided:
+        used_outflows = other_outflows_mm
+        used_asf = other_asf_mm
+        lcr_nsfr_basis = "client_provided"
+    else:
+        used_outflows = round(total_book * ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK, 1)
+        used_asf = round(total_book * ILLUSTRATIVE_ASF_PCT_OF_BOOK, 1)
+        lcr_nsfr_basis = "illustrative_default"
+
+    result = _compute_from_positions(
+        model_positions, used_outflows, used_asf, include_lcr_nsfr=True,
+    ) if model_positions else {
+        "total_book_mm": 0.0, "hqla_stock_mm": 0.0, "rsf_mm": 0.0, "rwa_mm": 0.0,
+        "capital_required_mm": 0.0, "lcr": None, "nsfr": None, "asf_mm": used_asf,
+    }
+    financing_rsf = sum(f["rsf_from_lend_commitment_mm"] for f in financing_classified)
+    financing_asf = sum(f["asf_credit_from_borrow_mm"] for f in financing_classified)
+    if financing_classified:
+        new_rsf = result["rsf_mm"] + financing_rsf
+        new_asf = result["asf_mm"] + financing_asf
+        result["rsf_mm"] = round(new_rsf, 1)
+        result["asf_mm"] = round(new_asf, 1)
+        result["nsfr"] = round(new_asf / new_rsf, 4) if new_rsf > 0 else None
+
+    if "annual_funding_cost_mm" in result:
+        del result["annual_funding_cost_mm"]
+
+    raw_notional_by_level = {}
+    haircut_adjusted_by_level = {}
+    for p, mp in zip(classified, model_positions):
+        lvl = p["hqla_level"]
+        raw_notional_by_level[lvl] = raw_notional_by_level.get(lvl, 0.0) + p["notional_mm"]
+        adj_val = 0.0 if lvl == "Not HQLA" else p["notional_mm"] * (1 - mp["haircut"])
+        haircut_adjusted_by_level[lvl] = haircut_adjusted_by_level.get(lvl, 0.0) + adj_val
+
+    confidence_counts = {}
+    for p in classified:
+        confidence_counts[p["confidence"]] = confidence_counts.get(p["confidence"], 0) + 1
+
+    response = {
+        "positions_classified": classified,
+        "financing_positions_classified": financing_classified,
+        "raw_notional_by_level_mm": {k: round(v, 1) for k, v in raw_notional_by_level.items()},
+        "haircut_adjusted_value_by_level_mm": {k: round(v, 1) for k, v in haircut_adjusted_by_level.items()},
+        "table_building_instructions": "For a per-level breakdown table, use "
+                                        "haircut_adjusted_value_by_level_mm (post-haircut, "
+                                        "pre-cap) as the 'value' column, and use "
+                                        "aggregate.hqla_stock_mm as the 'Total HQLA Stock' row "
+                                        "-- note the total may be SLIGHTLY LESS than the sum of "
+                                        "haircut_adjusted_value_by_level_mm if the Basel Level 2 "
+                                        "caps bind (Level 2 capped at 40% of HQLA, Level 2B "
+                                        "sub-capped at 15%). Never sum raw_notional_by_level_mm "
+                                        "or haircut_adjusted_value_by_level_mm and call it "
+                                        "'Total HQLA Stock' -- only aggregate.hqla_stock_mm is "
+                                        "correct for that label.",
+        "confidence_summary": confidence_counts,
+        "aggregate": result,
+        "lcr_nsfr_basis": lcr_nsfr_basis,
+        "lcr_nsfr_assumptions_used": {
+            "other_outflows_mm": used_outflows,
+            "other_asf_mm": used_asf,
+        },
+        "methodology_note": "Illustrative classification tool. 'exact_match' positions use "
+                             "precise regulatory factors (haircut, risk weight, RSF) from "
+                             "Aeonic's known asset universe; 'heuristic' and 'unclassified' "
+                             "positions use generic default assumptions and need manual "
+                             "review before being relied upon. This does not replace your "
+                             "own regulatory reporting process.",
+        "funding_cost_note": "Annual funding cost is not computed for real portfolios -- it "
+                              "would require YOUR actual borrowing rates and credit spreads "
+                              "per asset class, which aren't derivable from regulatory "
+                              "parameters the way haircuts and risk weights are. Provide your "
+                              "own blended cost of funds if you want that figure estimated.",
+    }
+    if financing_classified:
+        response["financing_note"] = (
+            "Matched-book/financing positions are a simplified representation -- they affect "
+            "NSFR (via the RSF/ASF mechanics shown per position) but NOT HQLA, RWA, or LCR. "
+            "Real securities financing transactions also carry counterparty credit RWA and "
+            "specific LCR collateral-flow treatment that this tool does not model. Treat this "
+            "as directional, not a substitute for your own SFT capital calculation."
+        )
+    if lcr_nsfr_basis == "illustrative_default":
+        response["lcr_nsfr_note"] = (
+            f"LCR/NSFR above use ILLUSTRATIVE placeholder assumptions, not your real figures: "
+            f"other net cash outflows assumed at {ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK*100:.0f}% of "
+            f"book (${used_outflows}mm), other available stable funding assumed at "
+            f"{ILLUSTRATIVE_ASF_PCT_OF_BOOK*100:.0f}% of book (${used_asf}mm). These are "
+            f"round-number planning assumptions, not derived from your data. Provide your "
+            f"real other_outflows_mm and other_asf_mm for an accurate LCR/NSFR."
+        )
+    return response
+
+
 def register_tools(mcp) -> None:
-    """Register all six Aeonic tools against the given MCPServer instance."""
+    """Register all seven Aeonic tools against the given MCPServer instance. Each tool here is a
+    thin wrapper: the actual logic lives in the standalone *_impl functions above, so the REST
+    API (server_remote.py) and the MCP/chat layer call the exact same code -- never two
+    implementations that can quietly drift apart."""
 
     @mcp.tool()
     def get_asset_universe() -> str:
         """Return the full Asset Universe: every asset class in the Aeonic Capital & Liquidity
         Optimization Model with its HQLA level, haircut, RSF weight, risk weight, funding tenor,
         illustrative funding spread, settlement speed, and regulatory notes."""
-        return json.dumps(ASSETS, indent=2)
+        return json.dumps(get_asset_universe_impl(), indent=2)
 
     @mcp.tool()
     def run_scenario(allocation: Optional[dict[str, float]] = None, preset: Optional[str] = None,
@@ -429,84 +839,7 @@ def register_tools(mcp) -> None:
         Returns LCR, NSFR, HQLA stock, RWA, capital required, annual funding cost, and the deltas
         (capital released, funding cost saved, net annualized value created) versus the current book.
         """
-        if preset:
-            if preset not in PRESETS:
-                return json.dumps({"error": f"Unknown preset '{preset}'. Use one of: {list(PRESETS.keys())}"})
-            alloc = PRESETS[preset]
-            shift_summary = None
-        elif shift_into is not None and shift_pct is not None:
-            if shift_into not in ASSET_NAMES:
-                return json.dumps({
-                    "error": f"Unknown asset class '{shift_into}'.",
-                    "valid_asset_classes": ASSET_NAMES,
-                })
-            idx = ASSET_NAMES.index(shift_into)
-            base = PRESETS["current"]
-            s = shift_pct / 100.0
-            cur_i = base[idx]
-            denom = 1.0 - cur_i
-            if s < 0 or s > denom + 1e-9:
-                return json.dumps({
-                    "error": f"Cannot shift {shift_pct} points into '{shift_into}': only "
-                             f"{denom*100:.1f} percentage points are available to move from other "
-                             f"asset classes (current share of '{shift_into}' is {cur_i*100:.1f}%).",
-                })
-            scale = (1 - s / denom) if denom > 1e-9 else 0.0
-            alloc = [
-                (cur_i + s) if j == idx else base[j] * scale
-                for j in range(len(ASSET_NAMES))
-            ]
-            # Report the exact dollar figures for this shift so the caller never has to
-            # (mis)calculate them itself -- this is the fix for a real observed failure
-            # mode where the calling model invented a plausible-sounding but wrong dollar
-            # amount instead of using this.
-            shift_summary = {
-                "asset": shift_into,
-                "shift_pct_requested": shift_pct,
-                "old_share_pct": round(cur_i * 100, 2),
-                "new_share_pct": round((cur_i + s) * 100, 2),
-                "old_notional_mm": round(cur_i * CONST["total_book"], 1),
-                "new_notional_mm": round((cur_i + s) * CONST["total_book"], 1),
-                "notional_added_mm": round(s * CONST["total_book"], 1),
-            }
-        elif allocation:
-            alloc = [allocation.get(name, 0.0) / 100.0 for name in ASSET_NAMES]
-            total = sum(alloc)
-            if abs(total - 1.0) > 0.01:
-                return json.dumps({
-                    "error": f"Allocation sums to {total*100:.1f}%, not 100%. "
-                             f"Provide percentages for all asset classes summing to 100.",
-                    "valid_asset_classes": ASSET_NAMES,
-                })
-            shift_summary = None
-        else:
-            return json.dumps({
-                "error": "Provide 'preset', or 'shift_into'+'shift_pct', or a full 'allocation'.",
-                "valid_presets": list(PRESETS.keys()),
-                "valid_asset_classes": ASSET_NAMES,
-            })
-
-        result = compute_metrics(alloc)
-        capital_released = CURRENT_METRICS["capital_required_mm"] - result["capital_required_mm"]
-        funding_savings = CURRENT_METRICS["annual_funding_cost_mm"] - result["annual_funding_cost_mm"]
-        net_value = capital_released * CONST["return_on_capital"] + funding_savings
-
-        response = {
-            "result": result,
-            "vs_current": {
-                "lcr_current": CURRENT_METRICS["lcr"],
-                "nsfr_current": CURRENT_METRICS["nsfr"],
-                "capital_released_mm": round(capital_released, 2),
-                "annual_funding_savings_mm": round(funding_savings, 2),
-                "net_value_created_mm_per_year": round(net_value, 2),
-            },
-            "methodology_note": "Illustrative demonstration model with representative sample data. "
-                                 "Regulatory factors are simplified approximations of Basel III, not a "
-                                 "production regulatory-reporting engine.",
-        }
-        if shift_summary:
-            response["shift_summary"] = shift_summary
-        return json.dumps(response, indent=2)
+        return json.dumps(run_scenario_impl(allocation, preset, shift_into, shift_pct), indent=2)
 
     @mcp.tool()
     def classify_asset(has_traditional_id: bool, is_direct_beneficial_ownership: bool,
@@ -527,48 +860,17 @@ def register_tools(mcp) -> None:
             underlying_security_type: optional free-text description of the underlying security
                 (e.g. "US Treasury", "equity"), used only for the returned rationale text.
         """
-        if not is_direct_beneficial_ownership:
-            return json.dumps({
-                "hqla_level": "Not HQLA (ineligible)",
-                "step": 3,
-                "rationale": "Wrapped or synthetic exposure that only tracks price, without a direct "
-                             "registered claim on the underlying asset, is ineligible regardless of "
-                             "what it tracks.",
-            })
-
-        if has_traditional_id:
-            level = "Driven by the underlying security's own Basel classification (see get_asset_universe)"
-            step = 1
-            rationale = (f"An ISIN/CUSIP is present, so classification follows the underlying "
-                         f"security's own type and issuer{' (' + underlying_security_type + ')' if underlying_security_type else ''} "
-                         f"— never the technology wrapper.")
-        else:
-            level = "Not HQLA (default)"
-            step = 2
-            rationale = ("No traditional ID exists — this is a native token. Default treatment under "
-                         "Basel is Not HQLA unless a jurisdiction-specific crypto-asset capital "
-                         "treatment applies; don't assume an override without confirming it.")
-
-        result = {"hqla_level": level, "step": step, "rationale": rationale}
-        if not venue_recognizes_as_collateral:
-            result["caveat"] = ("Venue-recognition gap flagged: the venue itself does not yet recognize "
-                                 "its own tokenized issuance as collateral internally, even though the "
-                                 "security's own HQLA eligibility (above) is unaffected.")
-        return json.dumps(result, indent=2)
+        return json.dumps(classify_asset_impl(
+            has_traditional_id, is_direct_beneficial_ownership,
+            venue_recognizes_as_collateral, underlying_security_type,
+        ), indent=2)
 
     @mcp.tool()
     def lookup_identifier(asset_name: str) -> str:
         """Look up the identifier crosswalk (traditional ISIN/CUSIP, digital DTI, networks, and
         beneficial ownership type) for a named digital collateral asset or fund. Matches loosely
         on the asset name (case-insensitive substring match)."""
-        q = asset_name.strip().lower()
-        matches = [row for row in CROSSWALK if q in row["asset"].lower()]
-        if not matches:
-            return json.dumps({
-                "error": f"No match for '{asset_name}'.",
-                "available_assets": [row["asset"] for row in CROSSWALK],
-            })
-        return json.dumps(matches, indent=2)
+        return json.dumps(lookup_identifier_impl(asset_name), indent=2)
 
     @mcp.tool()
     def list_sources(status_filter: Optional[str] = None) -> str:
@@ -579,53 +881,17 @@ def register_tools(mcp) -> None:
             status_filter: optional exact-match filter, e.g. "Live" to show only sources that are
                 genuinely connected without a data partnership. Omit to see all sources.
         """
-        rows = SOURCES
-        if status_filter:
-            rows = [r for r in rows if status_filter.lower() in r["status"].lower()]
-        return json.dumps(rows, indent=2)
+        return json.dumps(list_sources_impl(status_filter), indent=2)
 
     @mcp.tool()
     def get_live_collateral_inventory() -> str:
-        """Fetch LIVE current AUM/TVL for tokenized collateral products, right now, from two free
-        public data sources: DefiLlama's public API (6 products) and a direct Ethereum RPC + Chainlink
-        oracle call for Superstate USTB (independent of any data vendor). Franklin BENJI is tracked
-        by rwa.xyz, which requires a paid API key not configured here — its row is omitted; use
-        lookup_identifier for its static reference data instead."""
-        results = []
-        errors = []
-
-        try:
-            resp = httpx.get("https://api.llama.fi/protocols", timeout=15.0)
-            resp.raise_for_status()
-            protocols = {p["slug"]: p for p in resp.json()}
-            for slug, name in LIVE_SLUGS.items():
-                p = protocols.get(slug)
-                results.append({
-                    "asset": name,
-                    "source": "DefiLlama live API",
-                    "tvl_aum_mm": round(p["tvl"] / 1e6, 1) if p else None,
-                    "status": "Live" if p else "Not found in DefiLlama response",
-                })
-        except Exception as e:
-            errors.append(f"DefiLlama fetch failed: {e}")
-
-        ustb_result = {"asset": "Superstate USTB", "source": "Direct on-chain (Ethereum RPC + Chainlink oracle)"}
-        try:
-            ustb_result["tvl_aum_mm"] = round(get_ustb_live_aum(), 1)
-            ustb_result["status"] = "Live — no data vendor"
-        except Exception as e:
-            ustb_result["tvl_aum_mm"] = None
-            ustb_result["status"] = f"On-chain query failed: {e}"
-        results.append(ustb_result)
-
-        return json.dumps({"live_data": results, "errors": errors or None}, indent=2)
-
-    # Illustrative-default assumptions for firm-wide LCR/NSFR inputs, used only when the caller
-    # doesn't supply their own real figures. Defined once, here, as named constants -- not
-    # improvised per-conversation -- so the numbers are reproducible and the tool's own JSON
-    # output states exactly what was assumed, leaving nothing for the caller to mis-describe.
-    ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK = 0.25   # planning-level assumption, not derived from data
-    ILLUSTRATIVE_ASF_PCT_OF_BOOK = 1.00       # planning-level assumption, not derived from data
+        """Fetch LIVE current AUM/TVL for tokenized collateral products, right now, from free
+        public data sources: DefiLlama's stablecoins and protocols registries (6 products) and a
+        direct Ethereum RPC + Chainlink oracle call for Superstate USTB (independent of any data
+        vendor). Franklin BENJI is tracked by rwa.xyz, which requires a paid API key not
+        configured here — its row is omitted; use lookup_identifier for its static reference
+        data instead."""
+        return json.dumps(get_live_collateral_inventory_impl(), indent=2)
 
     @mcp.tool()
     def classify_portfolio(positions: Optional[list[dict]] = None,
@@ -685,192 +951,6 @@ def register_tools(mcp) -> None:
         Each held position gets a confidence tier: "exact_match", "heuristic", or "unclassified"
         -- always surface this plainly, never present heuristic/unclassified as exact.
         """
-        positions = positions or []
-        financing_positions = financing_positions or []
-        if not positions and not financing_positions:
-            return json.dumps({"error": "Provide at least one position (held or financing)."})
-
-        classified = []
-        model_positions = []
-        for i, pos in enumerate(positions):
-            desc = pos.get("description", "")
-            notional = pos.get("notional_mm")
-            if not desc or notional is None:
-                return json.dumps({
-                    "error": f"positions[{i}] is missing 'description' or 'notional_mm'.",
-                })
-            c = classify_position(desc)
-            attrs = dict(c["attributes"])
-            funding_tenor = pos.get("funding_tenor")
-            if funding_tenor:
-                if funding_tenor not in TENORS:
-                    return json.dumps({
-                        "error": f"positions[{i}]: unknown funding_tenor '{funding_tenor}'. "
-                                 f"Use one of: {list(TENORS.keys())}",
-                    })
-                attrs["tenor"] = funding_tenor
-            classified.append({
-                "description": desc,
-                "notional_mm": notional,
-                "hqla_level": c["level"],
-                "confidence": c["confidence"],
-                "matched_category": c["matched_category"],
-                "rationale": c["rationale"],
-                "funding_tenor_used": attrs["tenor"],
-            })
-            model_positions.append({"notional_mm": notional, "level": c["level"], **attrs})
-
-        financing_classified = []
-        for i, fp in enumerate(financing_positions):
-            desc = fp.get("description", "")
-            notional = fp.get("notional_mm")
-            structure = fp.get("structure")
-            if not desc or notional is None:
-                return json.dumps({"error": f"financing_positions[{i}] is missing 'description' or 'notional_mm'."})
-            if structure != "matched_book":
-                return json.dumps({
-                    "error": f"financing_positions[{i}]: 'structure' must be 'matched_book' "
-                             f"(the only supported financing structure right now).",
-                })
-            borrow_tenor = fp.get("borrow_tenor")
-            lend_tenor = fp.get("lend_tenor")
-            if borrow_tenor not in TENORS or lend_tenor not in TENORS:
-                return json.dumps({
-                    "error": f"financing_positions[{i}]: 'borrow_tenor' and 'lend_tenor' must "
-                             f"each be one of {list(TENORS.keys())}.",
-                })
-            c = classify_position(desc)
-            lend_rsf_rate = sft_lend_rsf(c["level"], lend_tenor)
-            rsf_contribution = notional * lend_rsf_rate
-            asf_contribution = notional * TENORS[borrow_tenor]["asf"]
-            net_nsfr_drag = rsf_contribution - asf_contribution
-            financing_classified.append({
-                "description": desc,
-                "notional_mm": notional,
-                "structure": "matched_book",
-                "borrow_tenor": borrow_tenor,
-                "lend_tenor": lend_tenor,
-                "lend_leg_rsf_rate": lend_rsf_rate,
-                "borrow_leg_asf_rate": TENORS[borrow_tenor]["asf"],
-                "underlying_classification": {
-                    "hqla_level": c["level"], "confidence": c["confidence"],
-                    "matched_category": c["matched_category"],
-                },
-                "hqla_contribution_mm": 0.0,
-                "rwa_contribution_mm": 0.0,
-                "rsf_from_lend_commitment_mm": round(rsf_contribution, 1),
-                "asf_credit_from_borrow_mm": round(asf_contribution, 1),
-                "net_nsfr_drag_mm": round(net_nsfr_drag, 1),
-                "note": "Not counted toward HQLA or RWA (not owned outright). RSF on the lend leg "
-                        "is graded by the LEND tenor and collateral quality (lend_leg_rsf_rate) -- "
-                        "short-tenor, Level-1-HQLA-backed lending gets preferential (lower) RSF, "
-                        "longer tenors converge toward full RSF -- a simplified approximation of "
-                        "Basel's short-residual-maturity SFT treatment, not the asset's generic "
-                        "held-position RSF weight. ASF on the borrow leg (borrow_leg_asf_rate) is "
-                        "graded by the BORROW tenor the same way held positions are. A positive "
-                        "net_nsfr_drag_mm means this trade consumes stable funding capacity; "
-                        "borrowing short to fund a longer lend commitment is unfavorable, while "
-                        "borrowing long to fund a short lend commitment can actually improve NSFR.",
-            })
-
-        total_book = sum(p["notional_mm"] for p in positions)
-        client_provided = other_outflows_mm is not None and other_asf_mm is not None
-        if client_provided:
-            used_outflows = other_outflows_mm
-            used_asf = other_asf_mm
-            lcr_nsfr_basis = "client_provided"
-        else:
-            used_outflows = round(total_book * ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK, 1)
-            used_asf = round(total_book * ILLUSTRATIVE_ASF_PCT_OF_BOOK, 1)
-            lcr_nsfr_basis = "illustrative_default"
-
-        result = _compute_from_positions(
-            model_positions, used_outflows, used_asf, include_lcr_nsfr=True,
-        ) if model_positions else {
-            "total_book_mm": 0.0, "hqla_stock_mm": 0.0, "rsf_mm": 0.0, "rwa_mm": 0.0,
-            "capital_required_mm": 0.0, "lcr": None, "nsfr": None, "asf_mm": used_asf,
-        }
-        # Fold financing positions' NSFR impact into the aggregate (HQLA/RWA untouched, since
-        # matched-book legs contribute zero to both by design).
-        financing_rsf = sum(f["rsf_from_lend_commitment_mm"] for f in financing_classified)
-        financing_asf = sum(f["asf_credit_from_borrow_mm"] for f in financing_classified)
-        if financing_classified:
-            new_rsf = result["rsf_mm"] + financing_rsf
-            new_asf = result["asf_mm"] + financing_asf
-            result["rsf_mm"] = round(new_rsf, 1)
-            result["asf_mm"] = round(new_asf, 1)
-            result["nsfr"] = round(new_asf / new_rsf, 4) if new_rsf > 0 else None
-
-        if "annual_funding_cost_mm" in result:
-            del result["annual_funding_cost_mm"]
-
-        # Renamed from the ambiguous "by_level_mm" -- this is RAW notional per level, before
-        # haircuts. A real failure mode: summing this to get "total HQLA stock" gives the wrong
-        # answer, because it skips haircuts and the Level 2 caps entirely. The correctly
-        # haircut-and-cap-adjusted total is aggregate['hqla_stock_mm'] -- always use that field
-        # for "total HQLA stock", never sum raw_notional_by_level_mm yourself.
-        raw_notional_by_level = {}
-        haircut_adjusted_by_level = {}
-        for p, mp in zip(classified, model_positions):
-            lvl = p["hqla_level"]
-            raw_notional_by_level[lvl] = raw_notional_by_level.get(lvl, 0.0) + p["notional_mm"]
-            adj_val = 0.0 if lvl == "Not HQLA" else p["notional_mm"] * (1 - mp["haircut"])
-            haircut_adjusted_by_level[lvl] = haircut_adjusted_by_level.get(lvl, 0.0) + adj_val
-
-        confidence_counts = {}
-        for p in classified:
-            confidence_counts[p["confidence"]] = confidence_counts.get(p["confidence"], 0) + 1
-
-        response = {
-            "positions_classified": classified,
-            "financing_positions_classified": financing_classified,
-            "raw_notional_by_level_mm": {k: round(v, 1) for k, v in raw_notional_by_level.items()},
-            "haircut_adjusted_value_by_level_mm": {k: round(v, 1) for k, v in haircut_adjusted_by_level.items()},
-            "table_building_instructions": "For a per-level breakdown table, use "
-                                            "haircut_adjusted_value_by_level_mm (post-haircut, "
-                                            "pre-cap) as the 'value' column, and use "
-                                            "aggregate.hqla_stock_mm as the 'Total HQLA Stock' row "
-                                            "-- note the total may be SLIGHTLY LESS than the sum of "
-                                            "haircut_adjusted_value_by_level_mm if the Basel Level 2 "
-                                            "caps bind (Level 2 capped at 40% of HQLA, Level 2B "
-                                            "sub-capped at 15%). Never sum raw_notional_by_level_mm "
-                                            "or haircut_adjusted_value_by_level_mm and call it "
-                                            "'Total HQLA Stock' -- only aggregate.hqla_stock_mm is "
-                                            "correct for that label.",
-            "confidence_summary": confidence_counts,
-            "aggregate": result,
-            "lcr_nsfr_basis": lcr_nsfr_basis,
-            "lcr_nsfr_assumptions_used": {
-                "other_outflows_mm": used_outflows,
-                "other_asf_mm": used_asf,
-            },
-            "methodology_note": "Illustrative classification tool. 'exact_match' positions use "
-                                 "precise regulatory factors (haircut, risk weight, RSF) from "
-                                 "Aeonic's known asset universe; 'heuristic' and 'unclassified' "
-                                 "positions use generic default assumptions and need manual "
-                                 "review before being relied upon. This does not replace your "
-                                 "own regulatory reporting process.",
-            "funding_cost_note": "Annual funding cost is not computed for real portfolios -- it "
-                                  "would require YOUR actual borrowing rates and credit spreads "
-                                  "per asset class, which aren't derivable from regulatory "
-                                  "parameters the way haircuts and risk weights are. Provide your "
-                                  "own blended cost of funds if you want that figure estimated.",
-        }
-        if financing_classified:
-            response["financing_note"] = (
-                "Matched-book/financing positions are a simplified representation -- they affect "
-                "NSFR (via the RSF/ASF mechanics shown per position) but NOT HQLA, RWA, or LCR. "
-                "Real securities financing transactions also carry counterparty credit RWA and "
-                "specific LCR collateral-flow treatment that this tool does not model. Treat this "
-                "as directional, not a substitute for your own SFT capital calculation."
-            )
-        if lcr_nsfr_basis == "illustrative_default":
-            response["lcr_nsfr_note"] = (
-                f"LCR/NSFR above use ILLUSTRATIVE placeholder assumptions, not your real figures: "
-                f"other net cash outflows assumed at {ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK*100:.0f}% of "
-                f"book (${used_outflows}mm), other available stable funding assumed at "
-                f"{ILLUSTRATIVE_ASF_PCT_OF_BOOK*100:.0f}% of book (${used_asf}mm). These are "
-                f"round-number planning assumptions, not derived from your data. Provide your "
-                f"real other_outflows_mm and other_asf_mm for an accurate LCR/NSFR."
-            )
-        return json.dumps(response, indent=2)
+        return json.dumps(classify_portfolio_impl(
+            positions, financing_positions, other_outflows_mm, other_asf_mm,
+        ), indent=2)
