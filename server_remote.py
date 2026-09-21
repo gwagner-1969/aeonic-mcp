@@ -28,6 +28,7 @@ Environment variables:
 
 import json
 import os
+import re
 import time
 from collections import defaultdict, deque
 
@@ -151,6 +152,50 @@ async def health(request: Request) -> JSONResponse:
     })
 
 
+def _final_answer_text(blocks: list) -> str:
+    """The text the model wrote AFTER its last tool result -- i.e. the actual answer.
+
+    The API returns every block in order: text, tool call, tool result, text, ... Text written
+    before a tool call is working narration ("Let me use the exact asset class name:"), which
+    should not be shown to the visitor. If nothing follows the last tool result (or no tool was
+    called), fall back to all text blocks so an answer is never lost."""
+    last_result = -1
+    for i, block in enumerate(blocks):
+        if block.get("type") == "mcp_tool_result":
+            last_result = i
+    tail = [b.get("text", "") for b in blocks[last_result + 1:] if b.get("type") == "text"]
+    answer = "\n".join(t for t in tail if t).strip()
+    if not answer:
+        answer = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+    return answer
+
+
+_TABLE_SEPARATOR = re.compile(r"\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*")
+
+
+def _plain_text(text: str) -> str:
+    """Safety net for the chat window, which shows plain text and cannot render markdown.
+    The prompt already asks for plain text; this removes any markdown that slips through so
+    visitors never see stray asterisks, pipes or hashes."""
+    lines = []
+    for line in text.splitlines():
+        s = line.rstrip()
+        if _TABLE_SEPARATOR.fullmatch(s) and "-" in s:
+            continue                                   # |---|---| divider rows
+        if s.strip().startswith("|") and s.strip().endswith("|"):
+            cells = [c.strip() for c in s.strip().strip("|").split("|")]
+            s = " - ".join(c for c in cells if c)      # table row -> one plain line
+        s = re.sub(r"^\s{0,3}#{1,6}\s+", "", s)         # headings
+        s = re.sub(r"^(\s*)\*\s+", r"\1- ", s)          # '* item' bullets -> '- item'
+        lines.append(s)
+    t = "\n".join(lines)
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t, flags=re.S)          # **bold**
+    t = re.sub(r"__(.+?)__", r"\1", t, flags=re.S)                # __bold__
+    t = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"\1", t)   # *italic*
+    t = t.replace("**", "").replace("`", "")
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
 async def chat(request: Request) -> JSONResponse:
     if not ANTHROPIC_API_KEY:
         return JSONResponse(
@@ -236,7 +281,31 @@ async def chat(request: Request) -> JSONResponse:
         "haircuts and the Basel Level 2 caps, which can make it slightly less than the simple "
         "sum of the per-level figures). Getting this wrong is a real, embarrassing error for a "
         "finance audience -- double check you're using aggregate.hqla_stock_mm specifically for "
-        "any 'Total HQLA Stock' line."
+        "any 'Total HQLA Stock' line.\n\n"
+        "FORMAT: plain text only. The chat window cannot render markdown, so never use "
+        "asterisks for bold or italics, pipe tables, or headers. Use short lines and simple "
+        "hyphen lists. Begin directly with the answer, with no lead-in sentence about what you "
+        "are doing. You may show a ratio as a percentage by multiplying by 100 (for example, "
+        "an LCR of 2.3746 is about 237%); show both, like 'LCR 2.37 (237%)'.\n\n"
+        "Never mention tool or function names (such as classify_portfolio, run_scenario or "
+        "lookup_identifier) in an answer; describe what the model did in plain words. Do not "
+        "narrate what you are about to do before calling a tool.\n\n"
+        "SIGN CONVENTION for matched-book financing: for each financing position, state the "
+        "direction and size of the effect by quoting nsfr_effect_plain from the tool. "
+        "net_nsfr_drag_mm is required stable funding minus available stable funding credited: "
+        "a NEGATIVE value means the trade IMPROVES the stable-funding position, because the "
+        "borrow leg credits more stable funding than the lend leg requires; a POSITIVE value "
+        "means it consumes stable funding. Never describe a negative value as a drag that "
+        "consumes funding. Example: -262.5 means the trade improves stable funding by $262.5M. "
+        "Borrowing long to fund a short lend helps NSFR; borrowing short to fund a longer lend "
+        "hurts it.\n\n"
+        "LIVE INVENTORY: report each row as the tool returns it, with its source. Do NOT add a "
+        "total across rows -- the rows are on different bases (token supply, platform-wide "
+        "totals across all of an issuer's funds, and on-chain supply times an oracle price), so "
+        "a sum would mislead. Do not add facts about a fund that the tools did not return, such "
+        "as who issues it or what it invests in. If a row's value is null, say the free public "
+        "data source does not report it. Franklin BENJI is the Franklin OnChain U.S. "
+        "Government Money Fund; it is not covered by the free live data."
     )
 
     try:
@@ -269,8 +338,7 @@ async def chat(request: Request) -> JSONResponse:
         )
 
     data = resp.json()
-    text_parts = [block["text"] for block in data.get("content", []) if block.get("type") == "text"]
-    answer = "\n".join(text_parts).strip() or "(No text response -- the model may have only called a tool.)"
+    answer = _plain_text(_final_answer_text(data.get("content", []))) or "(No text response -- the model may have only called a tool.)"
 
     return JSONResponse({"answer": answer})
 
