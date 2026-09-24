@@ -1,26 +1,26 @@
 """
 Aeonic Digital Collateral Intelligence — shared model core.
- 
+
 All data, calculation logic, and tool definitions live here. Both the local
 (stdio, Tier 0) and remote (streamable-http, Tier 1) servers import this
 module and register the same tools against their own MCPServer instance, so
 the two deployments can never drift out of sync with each other.
- 
+
 This is a direct extraction of the Tier 0 server's logic — no formulas were
 changed. run_scenario(preset="current") still returns LCR 151.5%, NSFR
 120.3%, capital $106.05mm, funding cost $100.06mm, matching the workbook
 and the aeonic.vc web tool exactly.
 """
- 
+
 import json
 from typing import Optional
- 
+
 import httpx
- 
+
 # =====================================================================
 # Static reference data
 # =====================================================================
- 
+
 ASSETS = [
     {"name": "Cash / Central Bank Reserves", "level": "Level 1", "haircut": 0.000, "rsf": 0.00,
      "rw": 0.00, "tenor": "O/N", "spread_bps": 0, "settlement": "T+0",
@@ -53,7 +53,7 @@ ASSETS = [
      "notes": "Not HQLA-eligible; illustrative catch-all for less-liquid assets."},
 ]
 ASSET_NAMES = [a["name"] for a in ASSETS]
- 
+
 TENORS = {
     "O/N": {"secured": 0.0480, "asf": 0.00, "outflow_eligible": True},
     "1M":  {"secured": 0.0485, "asf": 0.00, "outflow_eligible": True},
@@ -62,7 +62,7 @@ TENORS = {
     "1Y":  {"secured": 0.0505, "asf": 0.90, "outflow_eligible": False},
     "2Y+": {"secured": 0.0520, "asf": 1.00, "outflow_eligible": False},
 }
- 
+
 CONST = {
     "total_book": 2000.0,
     "capital_ratio": 0.105,
@@ -72,20 +72,20 @@ CONST = {
     "other_outflows": 550.0,
     "other_asf": 800.0,
 }
- 
+
 # Illustrative-default assumptions for firm-wide LCR/NSFR inputs on REAL client portfolios
 # (classify_portfolio), used only when the caller doesn't supply their own real figures.
 # Defined once, here, as named constants -- not improvised per-conversation -- so the
 # numbers are reproducible and the tool's own JSON output states exactly what was assumed.
 ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK = 0.25   # planning-level assumption, not derived from data
 ILLUSTRATIVE_ASF_PCT_OF_BOOK = 1.00       # planning-level assumption, not derived from data
- 
+
 PRESETS = {
     "current": [0.025, 0.20, 0.05, 0.15, 0.125, 0.10, 0.025, 0.075, 0.25],
     "scenario_a": [0.025, 0.15, 0.10, 0.15, 0.125, 0.075, 0.05, 0.075, 0.25],
     "scenario_b": [0.025, 0.05, 0.35, 0.10, 0.075, 0.025, 0.125, 0.10, 0.15],
 }
- 
+
 CROSSWALK = [
     {"asset": "BlackRock USD Institutional Digital Liquidity Fund (BUIDL)", "underlying_type": "US Treasury MMF interest",
      "traditional_id": "Lookup required (transfer agent)", "digital_id": "Lookup required (DTIF registry)",
@@ -124,7 +124,7 @@ CROSSWALK = [
      "networks": "Ethereum", "beneficial_ownership": "Direct (custodied or self-custodied)",
      "notes": "Not HQLA-eligible under Basel; separate prudential crypto-asset treatment."},
 ]
- 
+
 SOURCES = [
     {"source": "Anchorage Digital", "type": "Custodian API", "provides": "Custodied crypto & tokenized-asset positions",
      "ownership_visibility": "Yes — OCC-chartered qualified custodian", "status": "Requires data partnership"},
@@ -158,16 +158,16 @@ SOURCES = [
      "provides": "Traditional securities lending inventory", "ownership_visibility": "Yes",
      "status": "Already standard practice"},
 ]
- 
+
 LIVE_SLUGS = [
     {"slug": "blackrock-buidl", "symbol": "BUIDL", "name": "BlackRock BUIDL"},
     {"slug": "circle-usyc", "symbol": "USYC", "name": "Circle USYC (formerly Hashnote)"},
-    {"slug": "ondo-yield-assets", "symbol": "USDY", "name": "Ondo Yield Assets (OUSG/USDY)"},
+    {"slug": "ondo-yield-assets", "symbol": "USDY", "name": "Ondo USDY"},
     {"slug": "spiko", "symbol": "USTBL", "name": "Spiko"},
     {"slug": "centrifuge-protocol", "symbol": "CFG", "name": "Centrifuge Protocol"},
     {"slug": "wisdomtree", "symbol": "WTGXX", "name": "WisdomTree Connect"},
 ]
- 
+
 USTB_TOKEN = "0x43415eB6ff9DB7E26A15b704e7A3eDCe97d31C4e"
 USTB_ORACLE = "0x289B5036cd942e619E1Ee48670F98d214E745AAC"
 ETH_RPCS = [
@@ -176,20 +176,20 @@ ETH_RPCS = [
     "https://rpc.ankr.com/eth",
     "https://eth.llamarpc.com",
 ]
- 
- 
+
+
 # =====================================================================
 # Model engine
 # =====================================================================
- 
+
 def outflow_factor(level: str) -> float:
     return {"Level 1": 0.00, "Level 2A": 0.15, "Level 2B": 0.25}.get(level, 1.00)
- 
- 
+
+
 def sft_lend_rsf(hqla_level: str, lend_tenor: str) -> float:
     """RSF for the LEND leg of a matched-book / SFT-style financing position -- a simplified
     approximation of Basel's short-residual-maturity secured-lending treatment.
- 
+
     This is deliberately DIFFERENT from an asset's generic held-position RSF weight. A security
     lent out for 90 days is a 90-day secured loan to a counterparty, not a year-long holding of
     that asset type -- Basel's real SFT rules grade RSF by the LOAN's own tenor and whether it's
@@ -197,7 +197,7 @@ def sft_lend_rsf(hqla_level: str, lend_tenor: str) -> float:
     outright. This does NOT replicate every nuance of BCBS 295 (counterparty-type distinctions,
     specific netting rules, jurisdictional variations) -- it's a directionally-correct, stated
     simplification, same discipline as the rest of this model.
- 
+
     Short tenor + Level 1 HQLA collateral -> lowest (preferential) RSF.
     Short tenor + anything else -> a higher but still short-term-appropriate RSF.
     Longer tenors converge toward full RSF, since a long-dated lend is economically closer to an
@@ -209,8 +209,8 @@ def sft_lend_rsf(hqla_level: str, lend_tenor: str) -> float:
     if lend_tenor == "6M":
         return 0.50
     return 1.00  # 1Y, 2Y+: treat as effectively a full-tenor holding
- 
- 
+
+
 def _compute_from_positions(positions: list[dict], other_outflows_mm: float, other_asf_mm: float,
                              include_lcr_nsfr: bool = True) -> dict:
     """Core engine, generalized to any list of positions (not just the fixed 9-asset book).
@@ -220,7 +220,7 @@ def _compute_from_positions(positions: list[dict], other_outflows_mm: float, oth
     level1 = level2a = level2b = 0.0
     outflow_asset = rsf_total = asf_asset = rwa_total = funding_cost = 0.0
     total_book = sum(p["notional_mm"] for p in positions)
- 
+
     for p in positions:
         tenor = TENORS[p["tenor"]]
         notional = p["notional_mm"]
@@ -238,12 +238,12 @@ def _compute_from_positions(positions: list[dict], other_outflows_mm: float, oth
         asf_asset += notional * tenor["asf"]
         rwa_total += notional * p["rw"]
         funding_cost += notional * (tenor["secured"] + p["spread_bps"] / 10000)
- 
+
     level2b_capped = min(level2b, (CONST["level2b_cap"] / (1 - CONST["level2b_cap"])) * (level1 + level2a))
     level2_capped = min(level2a + level2b_capped, (CONST["level2_cap"] / (1 - CONST["level2_cap"])) * level1)
     hqla_total = level1 + level2_capped
     rwa_capital = rwa_total * CONST["capital_ratio"]
- 
+
     result = {
         "total_book_mm": round(total_book, 1),
         "hqla_stock_mm": round(hqla_total, 1),
@@ -259,8 +259,8 @@ def _compute_from_positions(positions: list[dict], other_outflows_mm: float, oth
         result["nsfr"] = round(asf_total / rsf_total, 4) if rsf_total > 0 else None
         result["asf_mm"] = round(asf_total, 1)
     return result
- 
- 
+
+
 def compute_metrics(allocation: list[float]) -> dict:
     """allocation: list of 9 fractions (0-1), same order as ASSETS, should sum to ~1.0"""
     notionals = [p * CONST["total_book"] for p in allocation]
@@ -272,17 +272,17 @@ def compute_metrics(allocation: list[float]) -> dict:
     result = _compute_from_positions(positions, CONST["other_outflows"], CONST["other_asf"])
     result["notionals_mm"] = {a["name"]: round(n, 1) for a, n in zip(ASSETS, notionals)}
     return result
- 
- 
+
+
 CURRENT_METRICS = compute_metrics(PRESETS["current"])
- 
- 
+
+
 # =====================================================================
 # Real-portfolio classification (distinct from the illustrative 9-asset
 # book above). Three confidence tiers, all surfaced to the caller so
 # nothing is silently guessed.
 # =====================================================================
- 
+
 # Default regulatory attributes per HQLA bucket, used only when a position
 # doesn't match one of the 9 known asset classes exactly. These are
 # reasonable Basel-style defaults for that bucket, not client-specific --
@@ -293,7 +293,7 @@ LEVEL_DEFAULTS = {
     "Level 2B": {"haircut": 0.50, "rsf": 0.50, "rw": 1.00, "tenor": "3M", "spread_bps": 15},
     "Not HQLA": {"haircut": 0.00, "rsf": 1.00, "rw": 1.00, "tenor": "6M", "spread_bps": 30},
 }
- 
+
 # Keyword -> known asset class, checked most-specific-first (tokenized
 # variants before their generic counterparts) so "tokenized treasury"
 # doesn't get caught by the generic "treasury" keyword.
@@ -315,7 +315,7 @@ KNOWN_CATEGORY_KEYWORDS = [
     (["cash", "central bank reserve", "central bank deposit"],
      "Cash / Central Bank Reserves"),
 ]
- 
+
 # Keyword -> HQLA level, used only when no known-category match is found.
 # Order matters: more specific / higher-quality indicators first.
 HEURISTIC_LEVEL_KEYWORDS = [
@@ -325,13 +325,13 @@ HEURISTIC_LEVEL_KEYWORDS = [
     (["equit", "common stock", "preferred stock", "private credit", "loan", "receivable",
       "real estate", "commodit"], "Not HQLA"),
 ]
- 
- 
+
+
 def classify_position(description: str) -> dict:
     """Classify one free-text position description. Returns level, the regulatory
     attributes to use, a confidence tier, and a human-readable rationale."""
     desc_lower = description.lower()
- 
+
     for keywords, asset_name in KNOWN_CATEGORY_KEYWORDS:
         if any(kw in desc_lower for kw in keywords):
             asset = next(a for a in ASSETS if a["name"] == asset_name)
@@ -343,7 +343,7 @@ def classify_position(description: str) -> dict:
                 "rationale": f"Matched known asset category '{asset_name}' -- using its exact "
                              f"regulatory factors from the Asset Universe.",
             }
- 
+
     for keywords, level in HEURISTIC_LEVEL_KEYWORDS:
         if any(kw in desc_lower for kw in keywords):
             return {
@@ -355,7 +355,7 @@ def classify_position(description: str) -> dict:
                              f"{level} -- using default {level} regulatory assumptions, NOT a "
                              f"client-specific determination. Verify before relying on this.",
             }
- 
+
     return {
         "level": "Not HQLA",
         "attributes": LEVEL_DEFAULTS["Not HQLA"],
@@ -365,8 +365,8 @@ def classify_position(description: str) -> dict:
                      "(the conservative assumption) -- this needs manual review, not automated "
                      "reliance.",
     }
- 
- 
+
+
 def _eth_call(client: httpx.Client, to: str, data: str) -> str:
     last_err = None
     for rpc in ETH_RPCS:
@@ -382,8 +382,8 @@ def _eth_call(client: httpx.Client, to: str, data: str) -> str:
             last_err = e
             continue
     raise last_err or RuntimeError("All RPC endpoints failed")
- 
- 
+
+
 def get_ustb_live_aum() -> float:
     with httpx.Client() as client:
         supply_hex = _eth_call(client, USTB_TOKEN, "0x18160ddd")
@@ -393,18 +393,18 @@ def get_ustb_live_aum() -> float:
     supply = int(supply_hex, 16) / (10 ** int(supply_dec_hex, 16))
     price = int(price_hex, 16) / (10 ** int(price_dec_hex, 16))
     return (supply * price) / 1e6
- 
- 
+
+
 def _fetch_protocol_tvl_mm(slug: str) -> Optional[float]:
     """Current value in $mm for a DefiLlama protocol slug, via the per-protocol /tvl endpoint.
     Returns None if DefiLlama reports no positive value. Raises on network/HTTP errors so the
     caller can record them.
- 
+
     Scope note: for these RWA platforms the figure covers ALL of the issuer's funds on the
     platform, not one token (DefiLlama's Spiko page labels its equivalent figure "RWA AUM",
     $2.584bn on its page vs $2.625bn from this endpoint, checked 2026-09-18; the 'wisdomtree'
     slug is WisdomTree Connect, the whole platform).
- 
+
     Why this exists: DefiLlama's bulk /protocols list returns tvl=None for RWA-category entries,
     even though the slugs are valid (spiko, centrifuge-protocol and wisdomtree were confirmed
     this way on 2026-09-18), so the bulk lookup alone cannot produce a number for them."""
@@ -414,18 +414,18 @@ def _fetch_protocol_tvl_mm(slug: str) -> Optional[float]:
     if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
         return round(value / 1e6, 1)
     return None
- 
- 
+
+
 # =====================================================================
 # Tool registration — call this once against any MCPServer instance
 # =====================================================================
- 
+
 def get_asset_universe_impl() -> list:
     """Standalone logic for get_asset_universe -- see the MCP tool docstring in register_tools
     for the full description. Returns the raw ASSETS list directly."""
     return ASSETS
- 
- 
+
+
 def run_scenario_impl(allocation: Optional[dict[str, float]] = None, preset: Optional[str] = None,
                        shift_into: Optional[str] = None, shift_pct: Optional[float] = None) -> dict:
     """Standalone logic for run_scenario -- see the MCP tool docstring in register_tools for the
@@ -482,12 +482,12 @@ def run_scenario_impl(allocation: Optional[dict[str, float]] = None, preset: Opt
             "valid_presets": list(PRESETS.keys()),
             "valid_asset_classes": ASSET_NAMES,
         }
- 
+
     result = compute_metrics(alloc)
     capital_released = CURRENT_METRICS["capital_required_mm"] - result["capital_required_mm"]
     funding_savings = CURRENT_METRICS["annual_funding_cost_mm"] - result["annual_funding_cost_mm"]
     net_value = capital_released * CONST["return_on_capital"] + funding_savings
- 
+
     response = {
         "result": result,
         "vs_current": {
@@ -504,8 +504,8 @@ def run_scenario_impl(allocation: Optional[dict[str, float]] = None, preset: Opt
     if shift_summary:
         response["shift_summary"] = shift_summary
     return response
- 
- 
+
+
 def classify_asset_impl(has_traditional_id: bool, is_direct_beneficial_ownership: bool,
                          venue_recognizes_as_collateral: bool = True,
                          underlying_security_type: Optional[str] = None) -> dict:
@@ -519,7 +519,7 @@ def classify_asset_impl(has_traditional_id: bool, is_direct_beneficial_ownership
                          "registered claim on the underlying asset, is ineligible regardless of "
                          "what it tracks.",
         }
- 
+
     if has_traditional_id:
         level = "Driven by the underlying security's own Basel classification (see get_asset_universe)"
         step = 1
@@ -532,15 +532,15 @@ def classify_asset_impl(has_traditional_id: bool, is_direct_beneficial_ownership
         rationale = ("No traditional ID exists — this is a native token. Default treatment under "
                      "Basel is Not HQLA unless a jurisdiction-specific crypto-asset capital "
                      "treatment applies; don't assume an override without confirming it.")
- 
+
     result = {"hqla_level": level, "step": step, "rationale": rationale}
     if not venue_recognizes_as_collateral:
         result["caveat"] = ("Venue-recognition gap flagged: the venue itself does not yet recognize "
                              "its own tokenized issuance as collateral internally, even though the "
                              "security's own HQLA eligibility (above) is unaffected.")
     return result
- 
- 
+
+
 def lookup_identifier_impl(asset_name: str):
     """Standalone logic for lookup_identifier. Returns a list of matches, or a dict with an
     'error' key if nothing matched -- same shape the MCP tool has always returned."""
@@ -552,8 +552,8 @@ def lookup_identifier_impl(asset_name: str):
             "available_assets": [row["asset"] for row in CROSSWALK],
         }
     return matches
- 
- 
+
+
 def list_sources_impl(status_filter: Optional[str] = None):
     """Standalone logic for list_sources. Returns a bare list, same shape the MCP tool has
     always returned."""
@@ -561,11 +561,11 @@ def list_sources_impl(status_filter: Optional[str] = None):
     if status_filter:
         rows = [r for r in rows if status_filter.lower() in r["status"].lower()]
     return rows
- 
- 
+
+
 def get_live_collateral_inventory_impl() -> dict:
     """Standalone logic for get_live_collateral_inventory.
- 
+
     FIX applied during the REST-API extraction (2026): the original version only checked
     DefiLlama's /protocols (TVL) registry by slug. BUIDL, USYC, Ondo's yield token, Spiko,
     Centrifuge, and WisdomTree are fund-style tokens DefiLlama tracks in a SEPARATE stablecoins
@@ -577,7 +577,7 @@ def get_live_collateral_inventory_impl() -> dict:
     """
     results = []
     errors = []
- 
+
     proto_by_slug = {}
     stable_by_symbol = {}
     try:
@@ -586,14 +586,14 @@ def get_live_collateral_inventory_impl() -> dict:
         proto_by_slug = {p["slug"]: p for p in resp.json()}
     except Exception as e:
         errors.append(f"DefiLlama /protocols fetch failed: {e}")
- 
+
     try:
         resp = httpx.get("https://stablecoins.llama.fi/stablecoins?includePrices=true", timeout=15.0)
         resp.raise_for_status()
         stable_by_symbol = {s["symbol"].upper(): s for s in resp.json().get("peggedAssets", [])}
     except Exception as e:
         errors.append(f"DefiLlama /stablecoins fetch failed: {e}")
- 
+
     for entry in LIVE_SLUGS:
         stable = stable_by_symbol.get(entry["symbol"].upper())
         if stable and stable.get("circulating", {}).get("peggedUSD"):
@@ -642,7 +642,7 @@ def get_live_collateral_inventory_impl() -> dict:
             "tvl_aum_mm": None,
             "status": "Not found in DefiLlama's free API registries",
         })
- 
+
     ustb_result = {"asset": "Superstate USTB", "source": "Direct on-chain (Ethereum RPC + Chainlink oracle)"}
     try:
         ustb_result["tvl_aum_mm"] = round(get_ustb_live_aum(), 1)
@@ -651,10 +651,10 @@ def get_live_collateral_inventory_impl() -> dict:
         ustb_result["tvl_aum_mm"] = None
         ustb_result["status"] = f"On-chain query failed: {e}"
     results.append(ustb_result)
- 
+
     return {"live_data": results, "errors": errors or None}
- 
- 
+
+
 def classify_portfolio_impl(positions: Optional[list[dict]] = None,
                              financing_positions: Optional[list[dict]] = None,
                              other_outflows_mm: Optional[float] = None,
@@ -665,7 +665,7 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
     financing_positions = financing_positions or []
     if not positions and not financing_positions:
         return {"error": "Provide at least one position (held or financing)."}
- 
+
     classified = []
     model_positions = []
     for i, pos in enumerate(positions):
@@ -693,7 +693,7 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
             "funding_tenor_used": attrs["tenor"],
         })
         model_positions.append({"notional_mm": notional, "level": c["level"], **attrs})
- 
+
     financing_classified = []
     for i, fp in enumerate(financing_positions):
         desc = fp.get("description", "")
@@ -764,7 +764,7 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
                     "Borrowing short to fund a longer lend commitment is unfavorable, while "
                     "borrowing long to fund a short lend commitment can actually improve NSFR.",
         })
- 
+
     total_book = sum(p["notional_mm"] for p in positions)
     client_provided = other_outflows_mm is not None and other_asf_mm is not None
     if client_provided:
@@ -775,7 +775,7 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
         used_outflows = round(total_book * ILLUSTRATIVE_OUTFLOW_PCT_OF_BOOK, 1)
         used_asf = round(total_book * ILLUSTRATIVE_ASF_PCT_OF_BOOK, 1)
         lcr_nsfr_basis = "illustrative_default"
- 
+
     result = _compute_from_positions(
         model_positions, used_outflows, used_asf, include_lcr_nsfr=True,
     ) if model_positions else {
@@ -790,10 +790,10 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
         result["rsf_mm"] = round(new_rsf, 1)
         result["asf_mm"] = round(new_asf, 1)
         result["nsfr"] = round(new_asf / new_rsf, 4) if new_rsf > 0 else None
- 
+
     if "annual_funding_cost_mm" in result:
         del result["annual_funding_cost_mm"]
- 
+
     raw_notional_by_level = {}
     haircut_adjusted_by_level = {}
     for p, mp in zip(classified, model_positions):
@@ -801,11 +801,11 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
         raw_notional_by_level[lvl] = raw_notional_by_level.get(lvl, 0.0) + p["notional_mm"]
         adj_val = 0.0 if lvl == "Not HQLA" else p["notional_mm"] * (1 - mp["haircut"])
         haircut_adjusted_by_level[lvl] = haircut_adjusted_by_level.get(lvl, 0.0) + adj_val
- 
+
     confidence_counts = {}
     for p in classified:
         confidence_counts[p["confidence"]] = confidence_counts.get(p["confidence"], 0) + 1
- 
+
     response = {
         "positions_classified": classified,
         "financing_positions_classified": financing_classified,
@@ -859,31 +859,31 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
             f"real other_outflows_mm and other_asf_mm for an accurate LCR/NSFR."
         )
     return response
- 
- 
+
+
 def register_tools(mcp) -> None:
     """Register all seven Aeonic tools against the given MCPServer instance. Each tool here is a
     thin wrapper: the actual logic lives in the standalone *_impl functions above, so the REST
     API (server_remote.py) and the MCP/chat layer call the exact same code -- never two
     implementations that can quietly drift apart."""
- 
+
     @mcp.tool()
     def get_asset_universe() -> str:
         """Return the full Asset Universe: every asset class in the Aeonic Capital & Liquidity
         Optimization Model with its HQLA level, haircut, RSF weight, risk weight, funding tenor,
         illustrative funding spread, settlement speed, and regulatory notes."""
         return json.dumps(get_asset_universe_impl(), indent=2)
- 
+
     @mcp.tool()
     def run_scenario(allocation: Optional[dict[str, float]] = None, preset: Optional[str] = None,
                       shift_into: Optional[str] = None, shift_pct: Optional[float] = None) -> str:
         """Run the LCR/NSFR/Capital/funding-cost model for a given collateral allocation and
         compare it to the current book.
- 
+
         Provide EXACTLY ONE of these three ways to specify the scenario:
- 
+
           1. preset: one of "current", "scenario_a" (Tokenization Tilt), "scenario_b" (Aggressive Tokenization)
- 
+
           2. shift_into + shift_pct: THE RIGHT CHOICE for questions like "what if I move 30% of the
              book into DTCC-tokenized Treasuries" or "shift 20 points into X". Give shift_into as an
              exact asset class name from get_asset_universe(), and shift_pct as the number of
@@ -893,23 +893,23 @@ def register_tools(mcp) -> None:
              "shift X% into Y, keep the rest as-is". Do NOT try to construct this by hand via the
              'allocation' parameter below; the proportional math is easy to get wrong, which is why
              this dedicated option exists.
- 
+
           3. allocation: a dict mapping EVERY ONE of the 9 asset class names to a percentage of book
              (0-100), summing to 100. Only use this when the caller wants to specify a full custom
              mix from scratch, not for "shift into X" style questions.
- 
+
         Returns LCR, NSFR, HQLA stock, RWA, capital required, annual funding cost, and the deltas
         (capital released, funding cost saved, net annualized value created) versus the current book.
         """
         return json.dumps(run_scenario_impl(allocation, preset, shift_into, shift_pct), indent=2)
- 
+
     @mcp.tool()
     def classify_asset(has_traditional_id: bool, is_direct_beneficial_ownership: bool,
                         venue_recognizes_as_collateral: bool = True,
                         underlying_security_type: Optional[str] = None) -> str:
         """Run the Aeonic regulatory classification logic (5-step decision chain) to determine
         an asset's likely HQLA treatment.
- 
+
         Args:
             has_traditional_id: True if the asset carries an ISIN/CUSIP (i.e. it's a tokenized
                 traditional security), False if it's a native token with no ISIN/CUSIP.
@@ -926,25 +926,25 @@ def register_tools(mcp) -> None:
             has_traditional_id, is_direct_beneficial_ownership,
             venue_recognizes_as_collateral, underlying_security_type,
         ), indent=2)
- 
+
     @mcp.tool()
     def lookup_identifier(asset_name: str) -> str:
         """Look up the identifier crosswalk (traditional ISIN/CUSIP, digital DTI, networks, and
         beneficial ownership type) for a named digital collateral asset or fund. Matches loosely
         on the asset name (case-insensitive substring match)."""
         return json.dumps(lookup_identifier_impl(asset_name), indent=2)
- 
+
     @mcp.tool()
     def list_sources(status_filter: Optional[str] = None) -> str:
         """List all digital collateral data sources in the Aeonic sourcing architecture, with
         connectivity type and an honest status for each.
- 
+
         Args:
             status_filter: optional exact-match filter, e.g. "Live" to show only sources that are
                 genuinely connected without a data partnership. Omit to see all sources.
         """
         return json.dumps(list_sources_impl(status_filter), indent=2)
- 
+
     @mcp.tool()
     def get_live_collateral_inventory() -> str:
         """Fetch LIVE current AUM/TVL for tokenized collateral products, right now, from free
@@ -955,7 +955,7 @@ def register_tools(mcp) -> None:
         lookup_identifier for its static reference data instead. Rows are not all the same
         measure (see each row's source), so do not add them into a single total."""
         return json.dumps(get_live_collateral_inventory_impl(), indent=2)
- 
+
     @mcp.tool()
     def classify_portfolio(positions: Optional[list[dict]] = None,
                             financing_positions: Optional[list[dict]] = None,
@@ -965,7 +965,7 @@ def register_tools(mcp) -> None:
         compute HQLA stock, RWA, and capital required. Use this whenever a user pastes or describes
         their own actual positions, as opposed to run_scenario (which only works with the fixed
         illustrative 9-asset demo book).
- 
+
         Args:
             positions: OPTIONAL list of OUTRIGHT HELD positions (the client owns these), each a
                 dict with:
@@ -975,7 +975,7 @@ def register_tools(mcp) -> None:
                   a specific tenor different from the security's typical default (e.g. "I hold
                   Treasuries but fund them overnight via repo"), set this to one of: "O/N", "1M",
                   "3M", "6M", "1Y", "2Y+". Omit to use the security's normal default tenor.
- 
+
             financing_positions: OPTIONAL list of REPO / SECURITIES LENDING / MATCHED-BOOK
                 structures -- use this for anything involving borrowing or lending a security on
                 one tenor versus another, NOT the 'positions' list above. Each dict needs:
@@ -985,7 +985,7 @@ def register_tools(mcp) -> None:
                   they borrow it on one tenor and re-lend it on another (classic collateral
                   transformation / intermediation). Requires "borrow_tenor" and "lend_tenor"
                   (each one of "O/N","1M","3M","6M","1Y","2Y+").
- 
+
                 MATCHED-BOOK TREATMENT (a real, deliberate simplification -- state this to the
                 user, don't present it as a precise regulatory determination): the security is
                 NOT counted toward HQLA stock or RWA (the client doesn't own it). RSF on the LEND
@@ -1003,17 +1003,17 @@ def register_tools(mcp) -> None:
                 to represent). This also does not replicate every nuance of the real Basel SFT
                 rules (counterparty-type distinctions, specific netting rules, jurisdictional
                 variations) -- it's a directionally-correct approximation, not a precise one.
- 
+
             other_outflows_mm / other_asf_mm: OPTIONAL real firm-wide figures (see below).
- 
+
         LCR and NSFR are ALWAYS returned -- either from the client's own real firm-wide figures
         (if both other_outflows_mm/other_asf_mm are provided) or from stated illustrative defaults
         (if not). Check "lcr_nsfr_basis" in the response and quote "lcr_nsfr_assumptions_used"
         directly -- never restate or re-derive the assumption from memory.
- 
+
         Each held position gets a confidence tier: "exact_match", "heuristic", or "unclassified"
         -- always surface this plainly, never present heuristic/unclassified as exact.
- 
+
         For each financing position, quote "nsfr_effect_plain" for the direction and size of its
         effect. "net_nsfr_drag_mm" is NEGATIVE when the trade IMPROVES stable funding.
         """
