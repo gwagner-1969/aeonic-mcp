@@ -26,9 +26,12 @@ Environment variables:
                         set this automatically; do not hardcode it.
 """
 
+import base64
+import hashlib
 import json
 import os
 import re
+import secrets
 import time
 from collections import defaultdict, deque
 
@@ -40,7 +43,7 @@ from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
 from aeonic_core import (
@@ -50,7 +53,182 @@ from aeonic_core import (
     classify_portfolio_impl,
 )
 
-API_KEY = os.environ.get("AEONIC_MCP_API_KEY")  # None => authless PoC mode
+API_KEY = os.environ.get("AEONIC_MCP_API_KEY")  # None => authless PoC mode (or OAuth-only, see below)
+
+# ---------------------------------------------------------------------------
+# OAuth 2.0 for /mcp -- lets claude.ai's standard "Add custom connector" button
+# work (paste URL, click Add, log in, done), instead of a hand-copied bearer
+# token that only Claude Desktop/Code's local config file can use.
+#
+# This implements just enough of the MCP Authorization spec for that button to
+# work: Protected Resource Metadata (RFC 9728), Authorization Server Metadata
+# (RFC 8414), Dynamic Client Registration (RFC 7591), and the Authorization
+# Code grant with PKCE (S256) -- no refresh-token grant, since a 90-day pilot
+# with a long-lived access token is simpler and does not need one.
+#
+# The "who can sign in" check is a single shared username/password pair (set
+# via MCP_OAUTH_USER / MCP_OAUTH_PASSWORD below), not a real user directory --
+# an intentional, stated simplification for a single-partner pilot, not a
+# claim of enterprise-grade identity management.
+# ---------------------------------------------------------------------------
+OAUTH_USER = os.environ.get("MCP_OAUTH_USER", "")
+OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "")
+OAUTH_ENABLED = bool(OAUTH_USER and OAUTH_PASSWORD)
+
+OAUTH_CODE_TTL_SECONDS = 600            # time allowed to complete the redirect + token exchange
+OAUTH_TOKEN_TTL_SECONDS = 365 * 24 * 3600  # long-lived on purpose -- no refresh grant implemented
+
+_oauth_clients: dict = {}   # client_id -> {"redirect_uris": [...]}
+_oauth_codes: dict = {}     # code -> {"client_id", "redirect_uri", "code_challenge", "expires_at"}
+_oauth_tokens: dict = {}    # access_token -> {"client_id", "issued_at"}
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _pkce_ok(verifier: str, challenge: str) -> bool:
+    if not verifier or not challenge:
+        return False
+    return _b64url(hashlib.sha256(verifier.encode()).digest()) == challenge
+
+
+def _oauth_base(request: Request) -> str:
+    # Railway terminates TLS in front of the app, so the app itself sees http; trust the
+    # forwarded proto for the URLs we hand back to the OAuth client.
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    return f"{proto}://{request.url.netloc}"
+
+
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    base = _oauth_base(request)
+    return JSONResponse({"resource": f"{base}/mcp", "authorization_servers": [base]})
+
+
+async def oauth_authorization_server(request: Request) -> JSONResponse:
+    base = _oauth_base(request)
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/oauth/authorize",
+        "token_endpoint": f"{base}/oauth/token",
+        "registration_endpoint": f"{base}/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    })
+
+
+async def oauth_register(request: Request) -> JSONResponse:
+    """Dynamic Client Registration (RFC 7591). Claude calls this itself the first time
+    someone adds the connector -- there is no pre-shared client ID to configure."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    redirect_uris = body.get("redirect_uris") or []
+    if not isinstance(redirect_uris, list) or not redirect_uris:
+        return JSONResponse({"error": "invalid_client_metadata", "error_description": "redirect_uris is required"}, status_code=400)
+    client_id = "aeonic-" + secrets.token_urlsafe(16)
+    _oauth_clients[client_id] = {"redirect_uris": redirect_uris}
+    return JSONResponse({
+        "client_id": client_id,
+        "redirect_uris": redirect_uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    }, status_code=201)
+
+
+_LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<title>Sign in | Aeonic Digital</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{{color-scheme:dark}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0D1145;
+    color:#F4F6FB;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+  form{{background:#172070;padding:2rem 2.2rem;border-radius:12px;width:320px;
+    border:1px solid rgba(47,128,255,0.35)}}
+  h1{{font-size:1.05rem;margin:0 0 0.3rem;font-weight:700}}
+  p.sub{{font-size:0.85rem;color:rgba(244,246,251,0.65);margin:0 0 1.3rem}}
+  label{{display:block;font-size:0.8rem;margin-bottom:0.3rem;color:rgba(244,246,251,0.8)}}
+  input[type=text],input[type=password]{{width:100%;padding:0.6rem 0.7rem;margin-bottom:1rem;
+    border-radius:6px;border:1px solid rgba(47,128,255,0.5);background:#0D1145;color:#fff;
+    box-sizing:border-box;font-size:0.95rem}}
+  button{{width:100%;padding:0.65rem;background:#2F80FF;color:#fff;border:none;border-radius:6px;
+    font-weight:600;font-size:0.95rem;cursor:pointer}}
+  button:hover{{background:#4a91ff}}
+  p.err{{color:#F87171;font-size:0.85rem;margin:0 0 1rem}}
+</style></head><body>
+<form method="POST">
+  <h1>Sign in to Aeonic Digital</h1>
+  <p class="sub">Connecting an AI assistant to the collateral intelligence tools.</p>
+  {error}
+  <input type="hidden" name="client_id" value="{client_id}">
+  <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+  <input type="hidden" name="state" value="{state}">
+  <input type="hidden" name="code_challenge" value="{code_challenge}">
+  <label for="u">Username</label>
+  <input type="text" id="u" name="username" autocomplete="username" autofocus>
+  <label for="p">Password</label>
+  <input type="password" id="p" name="password" autocomplete="current-password">
+  <button type="submit">Sign in</button>
+</form></body></html>"""
+
+
+async def oauth_authorize(request: Request):
+    """GET shows the login form; POST checks the credential and redirects back to the
+    client with a short-lived authorization code, per RFC 6749 section 4.1 with PKCE."""
+    if request.method == "GET":
+        q = request.query_params
+        if q.get("code_challenge_method", "S256") != "S256":
+            return JSONResponse({"error": "invalid_request", "error_description": "only S256 PKCE is supported"}, status_code=400)
+        return HTMLResponse(_LOGIN_PAGE.format(
+            error="", client_id=q.get("client_id", ""), redirect_uri=q.get("redirect_uri", ""),
+            state=q.get("state", ""), code_challenge=q.get("code_challenge", "")))
+
+    form = await request.form()
+    client_id = form.get("client_id", "")
+    redirect_uri = form.get("redirect_uri", "")
+    state = form.get("state", "")
+    code_challenge = form.get("code_challenge", "")
+
+    client = _oauth_clients.get(client_id)
+    if not client or redirect_uri not in client["redirect_uris"]:
+        # Never redirect on this failure -- an unrecognized redirect_uri is exactly the
+        # open-redirect case PKCE/registration exists to prevent.
+        return JSONResponse({"error": "invalid_client_or_redirect_uri"}, status_code=400)
+
+    if not OAUTH_ENABLED or form.get("username") != OAUTH_USER or form.get("password") != OAUTH_PASSWORD:
+        return HTMLResponse(_LOGIN_PAGE.format(
+            error='<p class="err">Incorrect username or password.</p>',
+            client_id=client_id, redirect_uri=redirect_uri, state=state,
+            code_challenge=code_challenge), status_code=401)
+
+    code = secrets.token_urlsafe(24)
+    _oauth_codes[code] = {"client_id": client_id, "redirect_uri": redirect_uri,
+                           "code_challenge": code_challenge, "expires_at": time.time() + OAUTH_CODE_TTL_SECONDS}
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}code={code}" + (f"&state={state}" if state else "")
+    return RedirectResponse(location, status_code=302)
+
+
+async def oauth_token(request: Request) -> JSONResponse:
+    form = await request.form()
+    if form.get("grant_type") != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    entry = _oauth_codes.pop(form.get("code", ""), None)
+    if not entry or entry["expires_at"] < time.time():
+        return JSONResponse({"error": "invalid_grant", "error_description": "code is invalid, used, or expired"}, status_code=400)
+    if form.get("redirect_uri") != entry["redirect_uri"] or form.get("client_id") != entry["client_id"]:
+        return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri or client_id mismatch"}, status_code=400)
+    if not _pkce_ok(form.get("code_verifier", ""), entry["code_challenge"]):
+        return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
+
+    token = secrets.token_urlsafe(32)
+    _oauth_tokens[token] = {"client_id": entry["client_id"], "issued_at": time.time()}
+    return JSONResponse({"access_token": token, "token_type": "Bearer", "expires_in": OAUTH_TOKEN_TTL_SECONDS})
 
 # --- REST API (v1) config -- a separate, deliberately simple concern from the MCP/chat auth
 # above. One or more comma-separated keys; each request must send one in the 'apikey' header
@@ -125,18 +303,30 @@ def _client_ip(request: Request) -> str:
 
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
-    """Only enforced if AEONIC_MCP_API_KEY is set. Unset = authless PoC mode.
-    Only applies to the MCP endpoint, not /health or /chat (which has its own
-    rate limiting instead, since it's meant for public website visitors)."""
+    """Only enforced on /mcp, and only once a gate is actually configured: either
+    AEONIC_MCP_API_KEY (a single static token, for Claude Desktop/Code's local config
+    file) or MCP_OAUTH_USER + MCP_OAUTH_PASSWORD (real OAuth, for claude.ai's "Add
+    custom connector" button). Neither set => authless PoC mode, unchanged.
+    Does not apply to /health, /chat, or the /oauth* and /.well-known/* routes, which
+    must stay reachable without a token so the OAuth flow itself can run."""
+
+    OPEN_PATHS = {"/health", "/chat", "/oauth/authorize", "/oauth/token", "/oauth/register",
+                  "/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"}
 
     async def dispatch(self, request: Request, call_next):
-        if not API_KEY or request.url.path != "/mcp":
+        gated = bool(API_KEY) or OAUTH_ENABLED
+        if not gated or request.url.path != "/mcp" or request.url.path in self.OPEN_PATHS:
             return await call_next(request)
 
         auth_header = request.headers.get("authorization", "")
         token = auth_header.removeprefix("Bearer ").strip()
-        if not token or token != API_KEY:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        valid = bool(token) and ((API_KEY and token == API_KEY) or token in _oauth_tokens)
+        if not valid:
+            headers = {}
+            if OAUTH_ENABLED:
+                base = _oauth_base(request)
+                headers["WWW-Authenticate"] = f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource"'
+            return JSONResponse({"error": "unauthorized"}, status_code=401, headers=headers)
 
         return await call_next(request)
 
@@ -145,7 +335,7 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "ok",
         "server": "aeonic-digital-collateral",
-        "auth_mode": "bearer-token" if API_KEY else "authless (PoC)",
+        "auth_mode": "oauth" if OAUTH_ENABLED else ("bearer-token" if API_KEY else "authless (PoC)"),
         "allowed_hosts": ALLOWED_HOSTS,
         "chat_enabled": bool(ANTHROPIC_API_KEY),
         "chat_model": CHAT_MODEL,
@@ -589,6 +779,11 @@ def build_app() -> Starlette:
     )
     mcp_app.router.routes.append(Route("/health", health, methods=["GET"]))
     mcp_app.router.routes.append(Route("/chat", chat, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/oauth/register", oauth_register, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]))
+    mcp_app.router.routes.append(Route("/oauth/token", oauth_token, methods=["POST"]))
 
     # REST API v1 -- registered here since Starlette routes aren't picked up just by being
     # defined as functions; they have to be explicitly added to the router like /health and
@@ -610,7 +805,7 @@ app = build_app()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
-    mode = "bearer-token" if API_KEY else "AUTHLESS (PoC mode)"
+    mode = "OAuth" if OAUTH_ENABLED else ("bearer-token" if API_KEY else "AUTHLESS (PoC mode)")
     print(f"Starting aeonic-digital-collateral in {mode} mode on port {port}")
     print(f"Allowed hosts: {ALLOWED_HOSTS}")
     print(f"Chat enabled: {bool(ANTHROPIC_API_KEY)} (model: {CHAT_MODEL})")
