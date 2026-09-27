@@ -998,3 +998,15 @@ def build_app() -> Starlette:
     mcp_app.router.routes.append(Route("/api/v1/capital/audit-log/{request_id}", rest_audit_log_get, methods=["GET"]))
     mcp_app.router.routes.append(Route("/api/v1/capital/audit-log", rest_audit_log_list, methods=["GET"]))
     mcp_app.router.routes.append(Route("/api/v1/openapi.json", rest_openapi_spec, methods=["GET"]))
+    return mcp_app
+
+
+app = build_app()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    mode = "OAuth" if OAUTH_ENABLED else ("bearer-token" if API_KEY else "AUTHLESS (PoC mode)")
+    print(f"Starting aeonic-digital-collateral in {mode} mode on port {port}")
+    print(f"Allowed hosts: {ALLOWED_HOSTS}")
+    print(f"Chat enabled: {bool(ANTHROPIC_API_KEY)} (model: {CHAT_MODEL})")
+    uvicorn.run(app, host="0.0.0.0", port=port)
