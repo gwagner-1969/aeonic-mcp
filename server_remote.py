@@ -75,6 +75,10 @@ OAUTH_USER = os.environ.get("MCP_OAUTH_USER", "")
 OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "")
 OAUTH_ENABLED = bool(OAUTH_USER and OAUTH_PASSWORD)
 
+# Ephemeral internal credential used only for /chat -> Anthropic -> this server /mcp.
+# This keeps the internal chat loop working while external /mcp access remains gated.
+INTERNAL_CHAT_TOKEN = secrets.token_urlsafe(32)
+
 OAUTH_CODE_TTL_SECONDS = 600            # time allowed to complete the redirect + token exchange
 OAUTH_TOKEN_TTL_SECONDS = 365 * 24 * 3600  # long-lived on purpose -- no refresh grant implemented
 
@@ -320,7 +324,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
         auth_header = request.headers.get("authorization", "")
         token = auth_header.removeprefix("Bearer ").strip()
-        valid = bool(token) and ((API_KEY and token == API_KEY) or token in _oauth_tokens)
+        valid = bool(token) and ((API_KEY and token == API_KEY) or token in _oauth_tokens or token == INTERNAL_CHAT_TOKEN)
         if not valid:
             headers = {}
             if OAUTH_ENABLED:
@@ -514,7 +518,7 @@ async def chat(request: Request) -> JSONResponse:
                     "system": system_prompt,
                     "messages": messages,
                     "mcp_servers": [
-                        {"type": "url", "url": SELF_MCP_URL, "name": "aeonic-collateral"}
+                        {"type": "url", "url": SELF_MCP_URL, "name": "aeonic-collateral", "authorization_token": INTERNAL_CHAT_TOKEN}
                     ],
                 },
             )
