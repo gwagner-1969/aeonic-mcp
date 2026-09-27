@@ -33,7 +33,9 @@ import os
 import re
 import secrets
 import time
+import uuid
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 
 import httpx
 import uvicorn
@@ -47,7 +49,7 @@ from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
 from aeonic_core import (
-    register_tools,
+    register_tools, MODEL_METHODOLOGY_VERSION,
     get_asset_universe_impl, run_scenario_impl, classify_asset_impl,
     lookup_identifier_impl, list_sources_impl, get_live_collateral_inventory_impl,
     classify_portfolio_impl,
@@ -75,8 +77,23 @@ OAUTH_USER = os.environ.get("MCP_OAUTH_USER", "")
 OAUTH_PASSWORD = os.environ.get("MCP_OAUTH_PASSWORD", "")
 OAUTH_ENABLED = bool(OAUTH_USER and OAUTH_PASSWORD)
 
-# Ephemeral internal credential used only for /chat -> Anthropic -> this server /mcp.
-# This keeps the internal chat loop working while external /mcp access remains gated.
+# ---------------------------------------------------------------------------
+# Internal service token -- lets THIS server's own /chat handler call back into
+# ITS OWN /mcp endpoint (via Anthropic's MCP connector) even when /mcp is gated
+# by AEONIC_MCP_API_KEY or OAuth for external clients (Sergio, Claude Desktop).
+#
+# Root cause this fixes: once /mcp started requiring a bearer token (bearer-key
+# era, and now OAuth), the /chat -> Anthropic -> mcp_servers=[self /mcp] round
+# trip never supplied one. Anthropic's Messages API validates connector auth
+# up front, so the very first /v1/messages call failed with HTTP 400 ("MCP
+# server 'aeonic-collateral' requires authentication...") before any tool ever
+# ran -- exactly the "Claude API returned 400" the chat widget showed.
+#
+# Generated fresh at process start, used only for this self-to-self call, and
+# accepted by ApiKeyMiddleware alongside the real API key / OAuth tokens. It
+# never needs to be set, shared, or rotated in Railway, and is unrelated to
+# ANTHROPIC_API_KEY.
+# ---------------------------------------------------------------------------
 INTERNAL_CHAT_TOKEN = secrets.token_urlsafe(32)
 
 OAUTH_CODE_TTL_SECONDS = 600            # time allowed to complete the redirect + token exchange
@@ -277,8 +294,81 @@ TRANSPORT_SECURITY = TransportSecuritySettings(
     allowed_origins=["https://claude.ai", "https://*.claude.ai"] + ALLOWED_HOSTS,
 )
 
+# ---------------------------------------------------------------------------
+# Audit trail -- persisted record of every calculation, plus inline provenance
+# so a result can be traced back later without relying on the caller to have
+# saved anything themselves.
+#
+# KNOWN, ACCEPTED LIMITATION (same category as the in-memory OAuth store):
+# this writes to a local file on Railway's container filesystem, which is
+# EPHEMERAL -- it does not survive a redeploy or restart. That's an
+# intentional, proportionate choice for a pilot: it gives real traceability
+# for a calculation someone asks about during the pilot window, which is the
+# actual near-term need, without building a hosted database before there's a
+# concrete reason to. If a client relies on this trail surviving indefinitely
+# (e.g. for their own compliance retention), that's the trigger to move this
+# to a durable store (a small hosted DB, or an append to Dropbox/S3) -- a
+# clearly separable follow-up, not a rebuild of this file.
+# ---------------------------------------------------------------------------
+AUDIT_LOG_PATH = os.environ.get("AEONIC_AUDIT_LOG_PATH", "audit_log.jsonl")
+
+
+def _audit_provenance() -> dict:
+    return {
+        "request_id": str(uuid.uuid4()),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "methodology_version": MODEL_METHODOLOGY_VERSION,
+    }
+
+
+def record_and_annotate(tool_name: str, inputs: dict, result) -> dict:
+    """Best-effort: append a full record (inputs + output + provenance) to the persisted
+    audit log, and -- when result is a dict -- merge the provenance block into it in place
+    so it's visible inline to whoever/whatever is looking at that result (the chat model,
+    a REST caller inspecting the JSON body). Always returns the provenance block so a
+    caller whose result ISN'T a dict (a bare list, e.g. get_asset_universe/list_sources)
+    can still surface request_id another way (server_remote does this via a response
+    header on REST calls). Never raises -- a logging failure must never break a real
+    tool call or API response."""
+    provenance = _audit_provenance()
+    try:
+        record = {**provenance, "tool": tool_name, "inputs": inputs, "output": result}
+        with open(AUDIT_LOG_PATH, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception as e:
+        print(f"[audit] failed to write audit log entry for {tool_name}: {e}")
+    if isinstance(result, dict):
+        result["provenance"] = provenance
+    return provenance
+
+
+def _read_audit_records(limit: int = 20, tool: str = None, request_id: str = None) -> list:
+    """Best-effort linear read of the (small, pilot-scale) audit log. Returns matching
+    records, newest first. Missing file -> empty list, never an error."""
+    records = []
+    try:
+        with open(AUDIT_LOG_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if tool and rec.get("tool") != tool:
+                    continue
+                if request_id and rec.get("request_id") != request_id:
+                    continue
+                records.append(rec)
+    except FileNotFoundError:
+        return []
+    records.reverse()
+    return records[:limit] if request_id is None else records
+
+
 mcp = MCPServer("aeonic-digital-collateral")
-register_tools(mcp)
+register_tools(mcp, audit_hook=record_and_annotate)
 
 _rate_limit_buckets: dict[str, deque] = defaultdict(deque)
 _rest_rate_limit_buckets: dict[str, deque] = defaultdict(deque)
@@ -324,7 +414,11 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
         auth_header = request.headers.get("authorization", "")
         token = auth_header.removeprefix("Bearer ").strip()
-        valid = bool(token) and ((API_KEY and token == API_KEY) or token in _oauth_tokens or token == INTERNAL_CHAT_TOKEN)
+        valid = bool(token) and (
+            (API_KEY and token == API_KEY)
+            or token in _oauth_tokens
+            or token == INTERNAL_CHAT_TOKEN
+        )
         if not valid:
             headers = {}
             if OAUTH_ENABLED:
@@ -343,6 +437,7 @@ async def health(request: Request) -> JSONResponse:
         "allowed_hosts": ALLOWED_HOSTS,
         "chat_enabled": bool(ANTHROPIC_API_KEY),
         "chat_model": CHAT_MODEL,
+        "methodology_version": MODEL_METHODOLOGY_VERSION,
     })
 
 
@@ -518,7 +613,12 @@ async def chat(request: Request) -> JSONResponse:
                     "system": system_prompt,
                     "messages": messages,
                     "mcp_servers": [
-                        {"type": "url", "url": SELF_MCP_URL, "name": "aeonic-collateral", "authorization_token": INTERNAL_CHAT_TOKEN}
+                        {
+                            "type": "url",
+                            "url": SELF_MCP_URL,
+                            "name": "aeonic-collateral",
+                            "authorization_token": INTERNAL_CHAT_TOKEN,
+                        }
                     ],
                 },
             )
@@ -574,11 +674,25 @@ async def _rest_json_body(request: Request):
         return None, JSONResponse({"error": "Invalid JSON body."}, status_code=400)
 
 
+def _provenance_headers(provenance: dict) -> dict:
+    """Every REST response carries these headers regardless of body shape (list or dict) --
+    the non-breaking way to make a bare-array response (lookup-identifier's success case,
+    asset-universe, sources) just as traceable as a dict one, without reshaping any
+    existing, already-documented response body."""
+    return {
+        "X-Aeonic-Request-Id": provenance["request_id"],
+        "X-Aeonic-Timestamp-Utc": provenance["timestamp_utc"],
+        "X-Aeonic-Methodology-Version": provenance["methodology_version"],
+    }
+
+
 async def rest_asset_universe(request: Request) -> JSONResponse:
     denied = _rest_auth_and_rate_limit(request)
     if denied:
         return denied
-    return JSONResponse({"assets": get_asset_universe_impl()})
+    assets = get_asset_universe_impl()
+    prov = record_and_annotate("get_asset_universe", {}, assets)
+    return JSONResponse({"assets": assets}, headers=_provenance_headers(prov))
 
 
 async def rest_sources(request: Request) -> JSONResponse:
@@ -586,7 +700,9 @@ async def rest_sources(request: Request) -> JSONResponse:
     if denied:
         return denied
     status_filter = request.query_params.get("status")
-    return JSONResponse({"sources": list_sources_impl(status_filter)})
+    sources = list_sources_impl(status_filter)
+    prov = record_and_annotate("list_sources", {"status_filter": status_filter}, sources)
+    return JSONResponse({"sources": sources}, headers=_provenance_headers(prov))
 
 
 async def rest_lookup_identifier(request: Request) -> JSONResponse:
@@ -596,14 +712,18 @@ async def rest_lookup_identifier(request: Request) -> JSONResponse:
     asset_name = request.query_params.get("asset_name", "")
     if not asset_name:
         return JSONResponse({"error": "Missing required query parameter 'asset_name'."}, status_code=400)
-    return JSONResponse(lookup_identifier_impl(asset_name))
+    result = lookup_identifier_impl(asset_name)
+    prov = record_and_annotate("lookup_identifier", {"asset_name": asset_name}, result)
+    return JSONResponse(result, headers=_provenance_headers(prov))
 
 
 async def rest_live_inventory(request: Request) -> JSONResponse:
     denied = _rest_auth_and_rate_limit(request)
     if denied:
         return denied
-    return JSONResponse(get_live_collateral_inventory_impl())
+    result = get_live_collateral_inventory_impl()
+    prov = record_and_annotate("get_live_collateral_inventory", {}, result)
+    return JSONResponse(result, headers=_provenance_headers(prov))
 
 
 async def rest_classify_asset(request: Request) -> JSONResponse:
@@ -617,12 +737,15 @@ async def rest_classify_asset(request: Request) -> JSONResponse:
     missing = [k for k in required if k not in body]
     if missing:
         return JSONResponse({"error": f"Missing required field(s): {', '.join(missing)}."}, status_code=400)
-    return JSONResponse(classify_asset_impl(
-        has_traditional_id=body["has_traditional_id"],
-        is_direct_beneficial_ownership=body["is_direct_beneficial_ownership"],
-        venue_recognizes_as_collateral=body.get("venue_recognizes_as_collateral", True),
-        underlying_security_type=body.get("underlying_security_type"),
-    ))
+    inputs = {
+        "has_traditional_id": body["has_traditional_id"],
+        "is_direct_beneficial_ownership": body["is_direct_beneficial_ownership"],
+        "venue_recognizes_as_collateral": body.get("venue_recognizes_as_collateral", True),
+        "underlying_security_type": body.get("underlying_security_type"),
+    }
+    result = classify_asset_impl(**inputs)
+    prov = record_and_annotate("classify_asset", inputs, result)
+    return JSONResponse(result, headers=_provenance_headers(prov))
 
 
 async def rest_run_scenario(request: Request) -> JSONResponse:
@@ -632,14 +755,16 @@ async def rest_run_scenario(request: Request) -> JSONResponse:
     body, err = await _rest_json_body(request)
     if err:
         return err
-    result = run_scenario_impl(
-        allocation=body.get("allocation"),
-        preset=body.get("preset"),
-        shift_into=body.get("shift_into"),
-        shift_pct=body.get("shift_pct"),
-    )
+    inputs = {
+        "allocation": body.get("allocation"),
+        "preset": body.get("preset"),
+        "shift_into": body.get("shift_into"),
+        "shift_pct": body.get("shift_pct"),
+    }
+    result = run_scenario_impl(**inputs)
+    prov = record_and_annotate("run_scenario", inputs, result)
     status = 400 if "error" in result else 200
-    return JSONResponse(result, status_code=status)
+    return JSONResponse(result, status_code=status, headers=_provenance_headers(prov))
 
 
 async def rest_classify_portfolio(request: Request) -> JSONResponse:
@@ -649,14 +774,51 @@ async def rest_classify_portfolio(request: Request) -> JSONResponse:
     body, err = await _rest_json_body(request)
     if err:
         return err
-    result = classify_portfolio_impl(
-        positions=body.get("positions"),
-        financing_positions=body.get("financing_positions"),
-        other_outflows_mm=body.get("other_outflows_mm"),
-        other_asf_mm=body.get("other_asf_mm"),
-    )
+    inputs = {
+        "positions": body.get("positions"),
+        "financing_positions": body.get("financing_positions"),
+        "other_outflows_mm": body.get("other_outflows_mm"),
+        "other_asf_mm": body.get("other_asf_mm"),
+    }
+    result = classify_portfolio_impl(**inputs)
+    prov = record_and_annotate("classify_portfolio", inputs, result)
     status = 400 if "error" in result else 200
-    return JSONResponse(result, status_code=status)
+    return JSONResponse(result, status_code=status, headers=_provenance_headers(prov))
+
+
+async def rest_audit_log_get(request: Request) -> JSONResponse:
+    """Pull a single past calculation back up by its request_id -- from either the
+    X-Aeonic-Request-Id response header (all REST calls) or the "provenance" field
+    inline in a dict response body (classify-portfolio, classify-asset, run-scenario,
+    live-inventory) or a chat answer. Subject to the ephemeral-filesystem limitation
+    noted on AUDIT_LOG_PATH above -- a record from before the last redeploy is gone."""
+    denied = _rest_auth_and_rate_limit(request)
+    if denied:
+        return denied
+    request_id = request.path_params.get("request_id", "")
+    records = _read_audit_records(request_id=request_id)
+    if not records:
+        return JSONResponse(
+            {"error": f"No audit record for request_id '{request_id}' -- either it never "
+                      f"existed, or the server has redeployed/restarted since (the audit "
+                      f"log does not currently survive that; see AUDIT_LOG_PATH)."},
+            status_code=404,
+        )
+    return JSONResponse(records[0])
+
+
+async def rest_audit_log_list(request: Request) -> JSONResponse:
+    """Recent audit records, newest first. Same ephemeral-filesystem caveat as above."""
+    denied = _rest_auth_and_rate_limit(request)
+    if denied:
+        return denied
+    try:
+        limit = min(int(request.query_params.get("limit", 20)), 200)
+    except ValueError:
+        return JSONResponse({"error": "'limit' must be an integer."}, status_code=400)
+    tool = request.query_params.get("tool")
+    records = _read_audit_records(limit=limit, tool=tool)
+    return JSONResponse({"count": len(records), "records": records})
 
 
 # Hand-written OpenAPI 3.0 spec -- Starlette (unlike FastAPI) doesn't generate this
@@ -678,6 +840,17 @@ OPENAPI_SPEC = {
         }
     },
     "security": [{"ApiKeyAuth": []}],
+    "x-audit-trail": {
+        "description": "Every response below carries X-Aeonic-Request-Id, "
+                        "X-Aeonic-Timestamp-Utc, and X-Aeonic-Methodology-Version response "
+                        "headers, and a dict-shaped body additionally carries the same three "
+                        "fields inline under 'provenance'. Use the request_id with GET "
+                        "/api/v1/capital/audit-log/{request_id} to retrieve the full persisted "
+                        "record (inputs + output) later. NOTE: the audit log is stored on the "
+                        "server's local filesystem and does not currently survive a redeploy "
+                        "or restart -- it covers the period since the server last restarted, "
+                        "not indefinitely.",
+    },
     "paths": {
         "/api/v1/capital/asset-universe": {
             "get": {
@@ -764,6 +937,27 @@ OPENAPI_SPEC = {
                 "responses": {"200": {"description": "OK"}, "400": {"description": "Invalid position data"}},
             }
         },
+        "/api/v1/capital/audit-log/{request_id}": {
+            "get": {
+                "summary": "Retrieve one past calculation's full persisted record by its "
+                           "request_id (from the X-Aeonic-Request-Id header or the 'provenance' "
+                           "field of an earlier response). Not available across a redeploy/restart.",
+                "parameters": [{"name": "request_id", "in": "path", "required": True,
+                                 "schema": {"type": "string"}}],
+                "responses": {"200": {"description": "OK"}, "404": {"description": "No such record (or server restarted since)"}},
+            }
+        },
+        "/api/v1/capital/audit-log": {
+            "get": {
+                "summary": "Recent audit records, newest first. Not available across a redeploy/restart.",
+                "parameters": [
+                    {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer", "default": 20, "maximum": 200}},
+                    {"name": "tool", "in": "query", "required": False, "schema": {"type": "string"},
+                     "description": "Filter to one tool, e.g. 'classify_portfolio'"},
+                ],
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
     },
 }
 
@@ -801,16 +995,6 @@ def build_app() -> Starlette:
     mcp_app.router.routes.append(Route("/api/v1/capital/classify-asset", rest_classify_asset, methods=["POST"]))
     mcp_app.router.routes.append(Route("/api/v1/capital/run-scenario", rest_run_scenario, methods=["POST"]))
     mcp_app.router.routes.append(Route("/api/v1/capital/classify-portfolio", rest_classify_portfolio, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/audit-log/{request_id}", rest_audit_log_get, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/audit-log", rest_audit_log_list, methods=["GET"]))
     mcp_app.router.routes.append(Route("/api/v1/openapi.json", rest_openapi_spec, methods=["GET"]))
-    return mcp_app
-
-
-app = build_app()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    mode = "OAuth" if OAUTH_ENABLED else ("bearer-token" if API_KEY else "AUTHLESS (PoC mode)")
-    print(f"Starting aeonic-digital-collateral in {mode} mode on port {port}")
-    print(f"Allowed hosts: {ALLOWED_HOSTS}")
-    print(f"Chat enabled: {bool(ANTHROPIC_API_KEY)} (model: {CHAT_MODEL})")
-    uvicorn.run(app, host="0.0.0.0", port=port)
