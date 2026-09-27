@@ -17,6 +17,13 @@ from typing import Optional
 
 import httpx
 
+# Single source of truth for which methodology version produced a calculation.
+# Bump this whenever a formula, factor table, or classification rule changes --
+# it's what the audit trail and the methodology/regulatory-mapping document
+# both reference, so a reviewer can tell exactly which version of the logic
+# produced any given number.
+MODEL_METHODOLOGY_VERSION = "1.0.0"
+
 # =====================================================================
 # Static reference data
 # =====================================================================
@@ -500,6 +507,7 @@ def run_scenario_impl(allocation: Optional[dict[str, float]] = None, preset: Opt
         "methodology_note": "Illustrative demonstration model with representative sample data. "
                              "Regulatory factors are simplified approximations of Basel III, not a "
                              "production regulatory-reporting engine.",
+        "methodology_version": MODEL_METHODOLOGY_VERSION,
     }
     if shift_summary:
         response["shift_summary"] = shift_summary
@@ -518,6 +526,7 @@ def classify_asset_impl(has_traditional_id: bool, is_direct_beneficial_ownership
             "rationale": "Wrapped or synthetic exposure that only tracks price, without a direct "
                          "registered claim on the underlying asset, is ineligible regardless of "
                          "what it tracks.",
+            "methodology_version": MODEL_METHODOLOGY_VERSION,
         }
 
     if has_traditional_id:
@@ -533,7 +542,8 @@ def classify_asset_impl(has_traditional_id: bool, is_direct_beneficial_ownership
                      "Basel is Not HQLA unless a jurisdiction-specific crypto-asset capital "
                      "treatment applies; don't assume an override without confirming it.")
 
-    result = {"hqla_level": level, "step": step, "rationale": rationale}
+    result = {"hqla_level": level, "step": step, "rationale": rationale,
+              "methodology_version": MODEL_METHODOLOGY_VERSION}
     if not venue_recognizes_as_collateral:
         result["caveat"] = ("Venue-recognition gap flagged: the venue itself does not yet recognize "
                              "its own tokenized issuance as collateral internally, even though the "
@@ -766,8 +776,25 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
         })
 
     total_book = sum(p["notional_mm"] for p in positions)
-    client_provided = other_outflows_mm is not None and other_asf_mm is not None
-    if client_provided:
+    both_provided = other_outflows_mm is not None and other_asf_mm is not None
+    either_provided = other_outflows_mm is not None or other_asf_mm is not None
+    if either_provided and not both_provided:
+        # Hard-fail rather than silently discarding the one real figure the
+        # caller DID provide and quietly substituting an illustrative default
+        # for it -- that would misrepresent a partially-real calculation as
+        # either fully real or fully illustrative, neither of which is true.
+        given = "other_outflows_mm" if other_outflows_mm is not None else "other_asf_mm"
+        missing = "other_asf_mm" if other_outflows_mm is not None else "other_outflows_mm"
+        return {
+            "error": (
+                f"'{given}' was provided but '{missing}' was not. LCR/NSFR must be computed "
+                f"from either BOTH real figures or NEITHER -- provide both real figures, or "
+                f"omit both to use illustrative defaults for both. Silently mixing one real "
+                f"figure with one illustrative default would misrepresent the result as more "
+                f"authoritative than it is."
+            ),
+        }
+    if both_provided:
         used_outflows = other_outflows_mm
         used_asf = other_asf_mm
         lcr_nsfr_basis = "client_provided"
@@ -835,6 +862,7 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
                              "positions use generic default assumptions and need manual "
                              "review before being relied upon. This does not replace your "
                              "own regulatory reporting process.",
+        "methodology_version": MODEL_METHODOLOGY_VERSION,
         "funding_cost_note": "Annual funding cost is not computed for real portfolios -- it "
                               "would require YOUR actual borrowing rates and credit spreads "
                               "per asset class, which aren't derivable from regulatory "
@@ -861,18 +889,38 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
     return response
 
 
-def register_tools(mcp) -> None:
+def register_tools(mcp, audit_hook=None) -> None:
     """Register all seven Aeonic tools against the given MCPServer instance. Each tool here is a
     thin wrapper: the actual logic lives in the standalone *_impl functions above, so the REST
     API (server_remote.py) and the MCP/chat layer call the exact same code -- never two
-    implementations that can quietly drift apart."""
+    implementations that can quietly drift apart.
+
+    audit_hook: optional callable audit_hook(tool_name: str, inputs: dict, result: dict). If
+    given, it's called with the exact inputs and result of every tool call, right after the
+    *_impl call and before serialization -- the single point where every MCP/chat tool
+    invocation passes through, regardless of which tool. Deliberately kept out of aeonic_core's
+    own responsibility to write anywhere: this module stays pure calculation logic with no I/O;
+    the caller (server_remote.py) supplies the actual audit sink. Left as None, tool behavior is
+    completely unchanged -- this never affects what a tool returns, only what a caller can
+    additionally observe. A failing audit_hook must never break the tool call itself, so it's
+    invoked defensively."""
+
+    def _audit(tool_name: str, inputs: dict, result) -> None:
+        if audit_hook is None:
+            return
+        try:
+            audit_hook(tool_name, inputs, result)
+        except Exception:
+            pass  # audit/logging is best-effort and must never break a tool response
 
     @mcp.tool()
     def get_asset_universe() -> str:
         """Return the full Asset Universe: every asset class in the Aeonic Capital & Liquidity
         Optimization Model with its HQLA level, haircut, RSF weight, risk weight, funding tenor,
         illustrative funding spread, settlement speed, and regulatory notes."""
-        return json.dumps(get_asset_universe_impl(), indent=2)
+        result = get_asset_universe_impl()
+        _audit("get_asset_universe", {}, result)
+        return json.dumps(result, indent=2)
 
     @mcp.tool()
     def run_scenario(allocation: Optional[dict[str, float]] = None, preset: Optional[str] = None,
@@ -901,7 +949,10 @@ def register_tools(mcp) -> None:
         Returns LCR, NSFR, HQLA stock, RWA, capital required, annual funding cost, and the deltas
         (capital released, funding cost saved, net annualized value created) versus the current book.
         """
-        return json.dumps(run_scenario_impl(allocation, preset, shift_into, shift_pct), indent=2)
+        inputs = {"allocation": allocation, "preset": preset, "shift_into": shift_into, "shift_pct": shift_pct}
+        result = run_scenario_impl(allocation, preset, shift_into, shift_pct)
+        _audit("run_scenario", inputs, result)
+        return json.dumps(result, indent=2)
 
     @mcp.tool()
     def classify_asset(has_traditional_id: bool, is_direct_beneficial_ownership: bool,
@@ -922,101 +973,28 @@ def register_tools(mcp) -> None:
             underlying_security_type: optional free-text description of the underlying security
                 (e.g. "US Treasury", "equity"), used only for the returned rationale text.
         """
-        return json.dumps(classify_asset_impl(
+        inputs = {
+            "has_traditional_id": has_traditional_id,
+            "is_direct_beneficial_ownership": is_direct_beneficial_ownership,
+            "venue_recognizes_as_collateral": venue_recognizes_as_collateral,
+            "underlying_security_type": underlying_security_type,
+        }
+        result = classify_asset_impl(
             has_traditional_id, is_direct_beneficial_ownership,
             venue_recognizes_as_collateral, underlying_security_type,
-        ), indent=2)
+        )
+        _audit("classify_asset", inputs, result)
+        return json.dumps(result, indent=2)
 
     @mcp.tool()
     def lookup_identifier(asset_name: str) -> str:
         """Look up the identifier crosswalk (traditional ISIN/CUSIP, digital DTI, networks, and
         beneficial ownership type) for a named digital collateral asset or fund. Matches loosely
         on the asset name (case-insensitive substring match)."""
-        return json.dumps(lookup_identifier_impl(asset_name), indent=2)
+        result = lookup_identifier_impl(asset_name)
+        _audit("lookup_identifier", {"asset_name": asset_name}, result)
+        return json.dumps(result, indent=2)
 
     @mcp.tool()
     def list_sources(status_filter: Optional[str] = None) -> str:
         """List all digital collateral data sources in the Aeonic sourcing architecture, with
-        connectivity type and an honest status for each.
-
-        Args:
-            status_filter: optional exact-match filter, e.g. "Live" to show only sources that are
-                genuinely connected without a data partnership. Omit to see all sources.
-        """
-        return json.dumps(list_sources_impl(status_filter), indent=2)
-
-    @mcp.tool()
-    def get_live_collateral_inventory() -> str:
-        """Fetch LIVE current AUM/TVL for tokenized collateral products, right now, from free
-        public data sources: DefiLlama's stablecoins and protocols registries (6 products) and a
-        direct Ethereum RPC + Chainlink oracle call for Superstate USTB (independent of any data
-        vendor). Franklin OnChain U.S. Government Money Fund (BENJI) is tracked by rwa.xyz,
-        which requires a paid API key not configured here — its row is omitted; use
-        lookup_identifier for its static reference data instead. Rows are not all the same
-        measure (see each row's source), so do not add them into a single total."""
-        return json.dumps(get_live_collateral_inventory_impl(), indent=2)
-
-    @mcp.tool()
-    def classify_portfolio(positions: Optional[list[dict]] = None,
-                            financing_positions: Optional[list[dict]] = None,
-                            other_outflows_mm: Optional[float] = None,
-                            other_asf_mm: Optional[float] = None) -> str:
-        """Classify a REAL client portfolio (not the illustrative demo book) into HQLA levels and
-        compute HQLA stock, RWA, and capital required. Use this whenever a user pastes or describes
-        their own actual positions, as opposed to run_scenario (which only works with the fixed
-        illustrative 9-asset demo book).
-
-        Args:
-            positions: OPTIONAL list of OUTRIGHT HELD positions (the client owns these), each a
-                dict with:
-                - "description": free-text description (e.g. "US Treasury Bill", "Agency MBS pool")
-                - "notional_mm": notional value in $ millions
-                - "funding_tenor": OPTIONAL override. If the client funds/finances this holding at
-                  a specific tenor different from the security's typical default (e.g. "I hold
-                  Treasuries but fund them overnight via repo"), set this to one of: "O/N", "1M",
-                  "3M", "6M", "1Y", "2Y+". Omit to use the security's normal default tenor.
-
-            financing_positions: OPTIONAL list of REPO / SECURITIES LENDING / MATCHED-BOOK
-                structures -- use this for anything involving borrowing or lending a security on
-                one tenor versus another, NOT the 'positions' list above. Each dict needs:
-                - "description": the underlying security being financed
-                - "notional_mm": notional value in $ millions
-                - "structure": "matched_book" -- the client does NOT own this security outright;
-                  they borrow it on one tenor and re-lend it on another (classic collateral
-                  transformation / intermediation). Requires "borrow_tenor" and "lend_tenor"
-                  (each one of "O/N","1M","3M","6M","1Y","2Y+").
-
-                MATCHED-BOOK TREATMENT (a real, deliberate simplification -- state this to the
-                user, don't present it as a precise regulatory determination): the security is
-                NOT counted toward HQLA stock or RWA (the client doesn't own it). RSF on the LEND
-                leg is graded by the lend tenor and collateral quality -- short-tenor lending
-                backed by Level 1 HQLA gets preferential (lower) RSF, longer tenors converge
-                toward full RSF -- NOT the asset's generic held-position RSF weight (a 90-day loan
-                is a 90-day loan, not a year of holding that asset type). ASF on the BORROW leg is
-                graded by the borrow tenor the same way held positions are (short borrow ~0% ASF,
-                longer borrow more). Tenor and direction both matter: borrowing short to fund a
-                longer lend commitment shows up as an NSFR drag (maturity transformation risk);
-                borrowing long to fund a short lend commitment can actually improve NSFR. NOT
-                modeled in this simplification, and you must say so if asked: LCR cash-flow/
-                collateral treatment of the financing legs, and counterparty credit RWA on the SFT
-                exposure itself (both are real capital considerations this tool does not attempt
-                to represent). This also does not replicate every nuance of the real Basel SFT
-                rules (counterparty-type distinctions, specific netting rules, jurisdictional
-                variations) -- it's a directionally-correct approximation, not a precise one.
-
-            other_outflows_mm / other_asf_mm: OPTIONAL real firm-wide figures (see below).
-
-        LCR and NSFR are ALWAYS returned -- either from the client's own real firm-wide figures
-        (if both other_outflows_mm/other_asf_mm are provided) or from stated illustrative defaults
-        (if not). Check "lcr_nsfr_basis" in the response and quote "lcr_nsfr_assumptions_used"
-        directly -- never restate or re-derive the assumption from memory.
-
-        Each held position gets a confidence tier: "exact_match", "heuristic", or "unclassified"
-        -- always surface this plainly, never present heuristic/unclassified as exact.
-
-        For each financing position, quote "nsfr_effect_plain" for the direction and size of its
-        effect. "net_nsfr_drag_mm" is NEGATIVE when the trade IMPROVES stable funding.
-        """
-        return json.dumps(classify_portfolio_impl(
-            positions, financing_positions, other_outflows_mm, other_asf_mm,
-        ), indent=2)
