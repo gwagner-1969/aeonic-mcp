@@ -886,6 +886,16 @@ def classify_portfolio_impl(positions: Optional[list[dict]] = None,
             f"round-number planning assumptions, not derived from your data. Provide your "
             f"real other_outflows_mm and other_asf_mm for an accurate LCR/NSFR."
         )
+    if lcr_nsfr_basis == "client_provided" and (used_outflows == 0 or used_asf == 0):
+        zero_field = "other_outflows_mm" if used_outflows == 0 else "other_asf_mm"
+        response["stress_case_note"] = (
+            f"'{zero_field}' was explicitly provided as zero. This is a valid, deliberately "
+            f"extreme stress construction (e.g. 'assume no other available stable funding') if "
+            f"that is what was intended, not a data error -- but it can produce an LCR or NSFR "
+            f"of 0.00, or an undefined ratio if it drives a denominator to zero. Confirm this "
+            f"was an intentional stress assumption before treating the resulting ratio as "
+            f"representative of a normal funding profile."
+        )
     return response
 
 
@@ -988,106 +998,3 @@ def register_tools(mcp, audit_hook=None) -> None:
 
     @mcp.tool()
     def lookup_identifier(asset_name: str) -> str:
-        """Look up the identifier crosswalk (traditional ISIN/CUSIP, digital DTI, networks, and
-        beneficial ownership type) for a named digital collateral asset or fund. Matches loosely
-        on the asset name (case-insensitive substring match)."""
-        result = lookup_identifier_impl(asset_name)
-        _audit("lookup_identifier", {"asset_name": asset_name}, result)
-        return json.dumps(result, indent=2)
-
-    @mcp.tool()
-    def list_sources(status_filter: Optional[str] = None) -> str:
-        """List all digital collateral data sources in the Aeonic sourcing architecture, with
-        connectivity type and an honest status for each.
-
-        Args:
-            status_filter: optional exact-match filter, e.g. "Live" to show only sources that are
-                genuinely connected without a data partnership. Omit to see all sources.
-        """
-        result = list_sources_impl(status_filter)
-        _audit("list_sources", {"status_filter": status_filter}, result)
-        return json.dumps(result, indent=2)
-
-    @mcp.tool()
-    def get_live_collateral_inventory() -> str:
-        """Fetch LIVE current AUM/TVL for tokenized collateral products, right now, from free
-        public data sources: DefiLlama's stablecoins and protocols registries (6 products) and a
-        direct Ethereum RPC + Chainlink oracle call for Superstate USTB (independent of any data
-        vendor). Franklin OnChain U.S. Government Money Fund (BENJI) is tracked by rwa.xyz,
-        which requires a paid API key not configured here — its row is omitted; use
-        lookup_identifier for its static reference data instead. Rows are not all the same
-        measure (see each row's source), so do not add them into a single total."""
-        result = get_live_collateral_inventory_impl()
-        _audit("get_live_collateral_inventory", {}, result)
-        return json.dumps(result, indent=2)
-
-    @mcp.tool()
-    def classify_portfolio(positions: Optional[list[dict]] = None,
-                            financing_positions: Optional[list[dict]] = None,
-                            other_outflows_mm: Optional[float] = None,
-                            other_asf_mm: Optional[float] = None) -> str:
-        """Classify a REAL client portfolio (not the illustrative demo book) into HQLA levels and
-        compute HQLA stock, RWA, and capital required. Use this whenever a user pastes or describes
-        their own actual positions, as opposed to run_scenario (which only works with the fixed
-        illustrative 9-asset demo book).
-
-        Args:
-            positions: OPTIONAL list of OUTRIGHT HELD positions (the client owns these), each a
-                dict with:
-                - "description": free-text description (e.g. "US Treasury Bill", "Agency MBS pool")
-                - "notional_mm": notional value in $ millions
-                - "funding_tenor": OPTIONAL override. If the client funds/finances this holding at
-                  a specific tenor different from the security's typical default (e.g. "I hold
-                  Treasuries but fund them overnight via repo"), set this to one of: "O/N", "1M",
-                  "3M", "6M", "1Y", "2Y+". Omit to use the security's normal default tenor.
-
-            financing_positions: OPTIONAL list of REPO / SECURITIES LENDING / MATCHED-BOOK
-                structures -- use this for anything involving borrowing or lending a security on
-                one tenor versus another, NOT the 'positions' list above. Each dict needs:
-                - "description": the underlying security being financed
-                - "notional_mm": notional value in $ millions
-                - "structure": "matched_book" -- the client does NOT own this security outright;
-                  they borrow it on one tenor and re-lend it on another (classic collateral
-                  transformation / intermediation). Requires "borrow_tenor" and "lend_tenor"
-                  (each one of "O/N","1M","3M","6M","1Y","2Y+").
-
-                MATCHED-BOOK TREATMENT (a real, deliberate simplification -- state this to the
-                user, don't present it as a precise regulatory determination): the security is
-                NOT counted toward HQLA stock or RWA (the client doesn't own it). RSF on the LEND
-                leg is graded by the lend tenor and collateral quality -- short-tenor lending
-                backed by Level 1 HQLA gets preferential (lower) RSF, longer tenors converge
-                toward full RSF -- NOT the asset's generic held-position RSF weight (a 90-day loan
-                is a 90-day loan, not a year of holding that asset type). ASF on the BORROW leg is
-                graded by the borrow tenor the same way held positions are (short borrow ~0% ASF,
-                longer borrow more). Tenor and direction both matter: borrowing short to fund a
-                longer lend commitment shows up as an NSFR drag (maturity transformation risk);
-                borrowing long to fund a short lend commitment can actually improve NSFR. NOT
-                modeled in this simplification, and you must say so if asked: LCR cash-flow/
-                collateral treatment of the financing legs, and counterparty credit RWA on the SFT
-                exposure itself (both are real capital considerations this tool does not attempt
-                to represent). This also does not replicate every nuance of the real Basel SFT
-                rules (counterparty-type distinctions, specific netting rules, jurisdictional
-                variations) -- it's a directionally-correct approximation, not a precise one.
-
-            other_outflows_mm / other_asf_mm: OPTIONAL real firm-wide figures (see below).
-
-        LCR and NSFR are ALWAYS returned -- either from the client's own real firm-wide figures
-        (if both other_outflows_mm/other_asf_mm are provided) or from stated illustrative defaults
-        (if not). Check "lcr_nsfr_basis" in the response and quote "lcr_nsfr_assumptions_used"
-        directly -- never restate or re-derive the assumption from memory.
-
-        Each held position gets a confidence tier: "exact_match", "heuristic", or "unclassified"
-        -- always surface this plainly, never present heuristic/unclassified as exact.
-
-        For each financing position, quote "nsfr_effect_plain" for the direction and size of its
-        effect. "net_nsfr_drag_mm" is NEGATIVE when the trade IMPROVES stable funding.
-        """
-        inputs = {
-            "positions": positions, "financing_positions": financing_positions,
-            "other_outflows_mm": other_outflows_mm, "other_asf_mm": other_asf_mm,
-        }
-        result = classify_portfolio_impl(
-            positions, financing_positions, other_outflows_mm, other_asf_mm,
-        )
-        _audit("classify_portfolio", inputs, result)
-        return json.dumps(result, indent=2)

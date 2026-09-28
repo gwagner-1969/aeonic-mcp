@@ -534,21 +534,77 @@ async def chat(request: Request) -> JSONResponse:
         "or a short table, not a long report. If the tools' own methodology notes flag "
         "something as illustrative or simplified, pass that caveat along rather than "
         "presenting figures as more authoritative than they are.\n\n"
-        "For any question of the form 'what if I shift/move/reallocate X% into <asset>' -- "
-        "call run_scenario with shift_into=<exact asset class name> and shift_pct=<the "
-        "number> DIRECTLY, in a single tool call, using the current book as the baseline. "
-        "Do not ask the user to specify the remaining allocation, do not ask them to choose "
-        "between options, and do not describe what you're about to do before doing it -- "
-        "the shift_into/shift_pct parameters exist precisely so this never requires "
-        "clarification. Only ask a clarifying question if the asset class name genuinely "
-        "doesn't match anything in get_asset_universe().\n\n"
+        "REGULATORY LANGUAGE -- Aeonic Digital is a decision-support analytics tool, not a "
+        "system of regulatory record, and you must never make or imply a regulatory compliance "
+        "determination. Never say a portfolio or scenario is 'regulatory-compliant', "
+        "'compliant on liquidity', 'meets the regulatory minimum', or similar. Never refer to "
+        "'the 100% minimum' or any other figure as if it were an official regulatory threshold "
+        "being satisfied or failed. Instead, describe the MODELED figure against the MODELED "
+        "threshold: say the 'modeled LCR remains above the modeled 1.00 threshold' (or below "
+        "it), not that the portfolio 'is compliant' or 'meets the requirement'. Where it fits "
+        "naturally, make clear these are model outputs for decision support, not a regulatory "
+        "reporting or compliance determination -- you don't need a disclaimer on every message, "
+        "but never phrase a result in a way that reads as one.\n\n"
+        "SCENARIO CONSTRUCTION -- pick the right shape, this is the most common source of a "
+        "wrong answer even when the arithmetic that follows is correct:\n\n"
+        "  (1) SINGLE-TARGET SHIFT -- the question names exactly ONE destination asset and "
+        "implies every other asset class absorbs the change proportionally (e.g. 'what if I "
+        "move 30% of the book into DTCC-tokenized Treasuries', 'shift 20 points into X'). "
+        "THEN, and only then: call run_scenario with shift_into=<exact asset class name> and "
+        "shift_pct=<the number> DIRECTLY, in a single tool call. Do not ask the user to specify "
+        "the remaining allocation, do not ask them to choose between options, and do not "
+        "describe what you're about to do before doing it. Only ask a clarifying question if "
+        "the asset class name genuinely doesn't match anything in get_asset_universe().\n\n"
+        "  (2) NAMED-SOURCE / MULTI-DESTINATION REALLOCATION -- the question names a specific "
+        "source asset to sell/reduce AND specifies where the proceeds go (a second asset, cash, "
+        "or a split between several), with everything else meant to stay put (e.g. 'sell half "
+        "my Treasuries, put 30% of that into digital equities and hold the rest in cash'). "
+        "shift_into/shift_pct is WRONG for this shape -- it proportionally draws the funding "
+        "from EVERY other asset class, including ones the user never mentioned, which silently "
+        "changes things they explicitly said should stay untouched. Instead: call "
+        "run_scenario(preset='current') first to read result.notionals_mm (the current dollar "
+        "amount in each asset), compute the new dollar amount for ONLY the named source and "
+        "destination asset(s) by hand from what the user described, leave every other asset's "
+        "notional exactly as run_scenario returned it, convert the full new set of 9 amounts to "
+        "percentages of total_book_mm, and call run_scenario again with that complete "
+        "allocation=<dict of all 9 asset names -> pct> (summing to 100). 'Cash' in this context "
+        "is the 'Cash / Central Bank Reserves' asset class from get_asset_universe -- proceeds "
+        "'held in cash' increase that line item's allocation, they are not a separate concept.\n\n"
+        "  (3) Whichever shape you used, say so implicitly by what you report -- never surface "
+        "which tool or parameters you used (see FORMAT below).\n\n"
         "CRITICAL -- do not invent numbers: every dollar figure, percentage, and ratio you "
         "state must come directly from a tool's JSON response, not from your own arithmetic "
         "on top of it. Do not narrate intermediate calculations ('the book is $X, so a Y% "
         "shift means moving $Z') -- the tool already returns the exact figures involved "
         "(total_book_mm, shift_summary with old/new notional and share, vs_current deltas). "
         "Quote those fields directly. If you did not get a field from a tool response, do "
-        "not state it as a fact.\n\n"
+        "not state it as a fact. This applies with special force to capital_required_mm and "
+        "rwa_mm in a scenario answer: quote result.capital_required_mm from THIS scenario's "
+        "own tool call, never a figure from an earlier turn or from the current-book baseline. "
+        "If the scenario moves notional out of a lower-risk-weight asset (check rw in "
+        "get_asset_universe) into a higher-risk-weight one, capital_required_mm MUST increase "
+        "in the response you quote -- if the number you're about to state doesn't move in that "
+        "direction, you have the wrong figure, not a surprising result; re-read the tool's "
+        "actual response rather than stating what you expect it to say.\n\n"
+        "NARRATION GUARDRAILS -- you explain the deterministic tool output, you do not add "
+        "economic reasoning the tool didn't provide:\n"
+        "  - Never call a LOWER lcr or nsfr value an 'improvement', 'gain', or similar -- a "
+        "smaller ratio is worse, full stop, regardless of which assets moved to cause it.\n"
+        "  - Available stable funding (ASF) is a property of how a position is FUNDED (its "
+        "tenor), never a property of holding a particular asset. Do not say an asset "
+        "'provides ASF', 'is a strong source of ASF', or similar -- cash, like every other "
+        "asset, has a required-stable-funding (RSF) weight for being HELD, not an ASF "
+        "contribution for being owned. If you want to explain an NSFR change, attribute it to "
+        "the RSF-weight difference between the assets that changed (quote rsf from "
+        "get_asset_universe or the position's own classification), not to funding/liabilities.\n"
+        "  - Never describe a change to liabilities, funding tenor, or 'other outflows/ASF' "
+        "that the user did not ask about and that isn't reflected in the tool's own inputs for "
+        "this call -- if only asset allocations changed, only asset-side figures (HQLA, RSF, "
+        "RWA) may have moved; do not invent a liabilities-side story to explain it.\n"
+        "  - Never restate an asset's HQLA level in your own words -- quote the tool's exact "
+        "level string ('Not HQLA', 'Level 1', 'Level 2A', 'Level 2B'). 'Not HQLA' is not a "
+        "lower tier of HQLA and must never be described as 'lower HQLA treatment', 'reduced "
+        "HQLA quality', or similar -- it is ineligible, a different thing from a lower level.\n\n"
         "If the user pastes or describes their OWN real positions (not the illustrative demo "
         "book), use classify_portfolio, not run_scenario. Parse their input into a list of "
         "{description, notional_mm} positions as best you can, call the tool, and report each "
@@ -562,6 +618,14 @@ async def chat(request: Request) -> JSONResponse:
         "precisely so you don't have to. classify_portfolio never returns a funding cost figure "
         "for real portfolios (by design -- it would require the client's own borrowing rates); "
         "proactively mention this limitation up front rather than waiting to be asked.\n\n"
+        "EXPLICIT ZERO other_outflows_mm/other_asf_mm is a valid, deliberate stress "
+        "construction, not an error -- e.g. 'don't assume any other available stable funding' "
+        "means other_asf_mm=0, not a request you should refuse or reinterpret. If the tool's "
+        "response includes 'stress_case_note', quote its point plainly: this is an intentional "
+        "extreme assumption, which can legitimately produce an NSFR of 0.00 or an undefined "
+        "ratio. State the result and the reason (zero available stable funding was assumed, by "
+        "instruction) without hedging or second-guessing the user's stated assumption, and "
+        "without implying anything is broken.\n\n"
         "CRITICAL for HQLA totals: classify_portfolio's response has THREE different level-based "
         "numbers that are easy to confuse -- read table_building_instructions in the response "
         "every time. raw_notional_by_level_mm and haircut_adjusted_value_by_level_mm are both "
@@ -934,79 +998,3 @@ OPENAPI_SPEC = {
                         "other_asf_mm": {"type": "number", "description": "Real firm-wide figure, optional"},
                     },
                 }}}},
-                "responses": {"200": {"description": "OK"}, "400": {"description": "Invalid position data"}},
-            }
-        },
-        "/api/v1/capital/audit-log/{request_id}": {
-            "get": {
-                "summary": "Retrieve one past calculation's full persisted record by its "
-                           "request_id (from the X-Aeonic-Request-Id header or the 'provenance' "
-                           "field of an earlier response). Not available across a redeploy/restart.",
-                "parameters": [{"name": "request_id", "in": "path", "required": True,
-                                 "schema": {"type": "string"}}],
-                "responses": {"200": {"description": "OK"}, "404": {"description": "No such record (or server restarted since)"}},
-            }
-        },
-        "/api/v1/capital/audit-log": {
-            "get": {
-                "summary": "Recent audit records, newest first. Not available across a redeploy/restart.",
-                "parameters": [
-                    {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer", "default": 20, "maximum": 200}},
-                    {"name": "tool", "in": "query", "required": False, "schema": {"type": "string"},
-                     "description": "Filter to one tool, e.g. 'classify_portfolio'"},
-                ],
-                "responses": {"200": {"description": "OK"}},
-            }
-        },
-    },
-}
-
-
-async def rest_openapi_spec(request: Request) -> JSONResponse:
-    return JSONResponse(OPENAPI_SPEC)
-
-
-def build_app() -> Starlette:
-    mcp_app = mcp.streamable_http_app(stateless_http=True, transport_security=TRANSPORT_SECURITY)
-    mcp_app.add_middleware(ApiKeyMiddleware)
-    mcp_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=CHAT_ALLOWED_ORIGINS,
-        allow_methods=["POST", "GET", "OPTIONS"],
-        allow_headers=["*"],
-    )
-    mcp_app.router.routes.append(Route("/health", health, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/chat", chat, methods=["POST"]))
-    mcp_app.router.routes.append(Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/oauth/register", oauth_register, methods=["POST"]))
-    mcp_app.router.routes.append(Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]))
-    mcp_app.router.routes.append(Route("/oauth/token", oauth_token, methods=["POST"]))
-
-    # REST API v1 -- registered here since Starlette routes aren't picked up just by being
-    # defined as functions; they have to be explicitly added to the router like /health and
-    # /chat above. (Confirmed this was missing: none of the seven routes below, or the spec
-    # endpoint, were actually reachable until this fix -- everything below 404'd despite the
-    # OpenAPI spec describing it as live.)
-    mcp_app.router.routes.append(Route("/api/v1/capital/asset-universe", rest_asset_universe, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/api/v1/capital/sources", rest_sources, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/api/v1/capital/lookup-identifier", rest_lookup_identifier, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/api/v1/capital/live-inventory", rest_live_inventory, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/api/v1/capital/classify-asset", rest_classify_asset, methods=["POST"]))
-    mcp_app.router.routes.append(Route("/api/v1/capital/run-scenario", rest_run_scenario, methods=["POST"]))
-    mcp_app.router.routes.append(Route("/api/v1/capital/classify-portfolio", rest_classify_portfolio, methods=["POST"]))
-    mcp_app.router.routes.append(Route("/api/v1/capital/audit-log/{request_id}", rest_audit_log_get, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/api/v1/capital/audit-log", rest_audit_log_list, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/api/v1/openapi.json", rest_openapi_spec, methods=["GET"]))
-    return mcp_app
-
-
-app = build_app()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    mode = "OAuth" if OAUTH_ENABLED else ("bearer-token" if API_KEY else "AUTHLESS (PoC mode)")
-    print(f"Starting aeonic-digital-collateral in {mode} mode on port {port}")
-    print(f"Allowed hosts: {ALLOWED_HOSTS}")
-    print(f"Chat enabled: {bool(ANTHROPIC_API_KEY)} (model: {CHAT_MODEL})")
-    uvicorn.run(app, host="0.0.0.0", port=port)
