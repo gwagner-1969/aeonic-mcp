@@ -998,3 +998,79 @@ OPENAPI_SPEC = {
                         "other_asf_mm": {"type": "number", "description": "Real firm-wide figure, optional"},
                     },
                 }}}},
+                "responses": {"200": {"description": "OK"}, "400": {"description": "Invalid position data"}},
+            }
+        },
+        "/api/v1/capital/audit-log/{request_id}": {
+            "get": {
+                "summary": "Retrieve one past calculation's full persisted record by its "
+                           "request_id (from the X-Aeonic-Request-Id header or the 'provenance' "
+                           "field of an earlier response). Not available across a redeploy/restart.",
+                "parameters": [{"name": "request_id", "in": "path", "required": True,
+                                 "schema": {"type": "string"}}],
+                "responses": {"200": {"description": "OK"}, "404": {"description": "No such record (or server restarted since)"}},
+            }
+        },
+        "/api/v1/capital/audit-log": {
+            "get": {
+                "summary": "Recent audit records, newest first. Not available across a redeploy/restart.",
+                "parameters": [
+                    {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer", "default": 20, "maximum": 200}},
+                    {"name": "tool", "in": "query", "required": False, "schema": {"type": "string"},
+                     "description": "Filter to one tool, e.g. 'classify_portfolio'"},
+                ],
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+    },
+}
+
+
+async def rest_openapi_spec(request: Request) -> JSONResponse:
+    return JSONResponse(OPENAPI_SPEC)
+
+
+def build_app() -> Starlette:
+    mcp_app = mcp.streamable_http_app(stateless_http=True, transport_security=TRANSPORT_SECURITY)
+    mcp_app.add_middleware(ApiKeyMiddleware)
+    mcp_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CHAT_ALLOWED_ORIGINS,
+        allow_methods=["POST", "GET", "OPTIONS"],
+        allow_headers=["*"],
+    )
+    mcp_app.router.routes.append(Route("/health", health, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/chat", chat, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/oauth/register", oauth_register, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]))
+    mcp_app.router.routes.append(Route("/oauth/token", oauth_token, methods=["POST"]))
+
+    # REST API v1 -- registered here since Starlette routes aren't picked up just by being
+    # defined as functions; they have to be explicitly added to the router like /health and
+    # /chat above. (Confirmed this was missing: none of the seven routes below, or the spec
+    # endpoint, were actually reachable until this fix -- everything below 404'd despite the
+    # OpenAPI spec describing it as live.)
+    mcp_app.router.routes.append(Route("/api/v1/capital/asset-universe", rest_asset_universe, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/sources", rest_sources, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/lookup-identifier", rest_lookup_identifier, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/live-inventory", rest_live_inventory, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/classify-asset", rest_classify_asset, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/run-scenario", rest_run_scenario, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/classify-portfolio", rest_classify_portfolio, methods=["POST"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/audit-log/{request_id}", rest_audit_log_get, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/capital/audit-log", rest_audit_log_list, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/api/v1/openapi.json", rest_openapi_spec, methods=["GET"]))
+    return mcp_app
+
+
+app = build_app()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    mode = "OAuth" if OAUTH_ENABLED else ("bearer-token" if API_KEY else "AUTHLESS (PoC mode)")
+    print(f"Starting aeonic-digital-collateral in {mode} mode on port {port}")
+    print(f"Allowed hosts: {ALLOWED_HOSTS}")
+    print(f"Chat enabled: {bool(ANTHROPIC_API_KEY)} (model: {CHAT_MODEL})")
+    uvicorn.run(app, host="0.0.0.0", port=port)
