@@ -1074,3 +1074,4 @@ if __name__ == "__main__":
     print(f"Allowed hosts: {ALLOWED_HOSTS}")
     print(f"Chat enabled: {bool(ANTHROPIC_API_KEY)} (model: {CHAT_MODEL})")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
