@@ -266,6 +266,16 @@ CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-haiku-4-5-20251001")
 CHAT_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
     "CHAT_ALLOWED_ORIGINS", "https://aeonic.vc,https://aeonic.digital"
 ).split(",") if o.strip()]
+# Optional: additionally allow Netlify deploy-preview origins for the
+# aeonic.digital site. Unset (default) = exact-match allow-list only, i.e. no
+# behaviour change. Starlette applies this with re.fullmatch, so it must match
+# the WHOLE origin; wildcard-all patterns are refused at startup.
+CHAT_ALLOWED_ORIGIN_REGEX = os.environ.get("CHAT_ALLOWED_ORIGIN_REGEX", "").strip() or None
+if CHAT_ALLOWED_ORIGIN_REGEX and (
+    not CHAT_ALLOWED_ORIGIN_REGEX.startswith("^https://")
+    or not CHAT_ALLOWED_ORIGIN_REGEX.endswith("$")
+):
+    raise RuntimeError("CHAT_ALLOWED_ORIGIN_REGEX must be anchored: start with ^https:// and end with $")
 MAX_MESSAGE_CHARS = 800
 MAX_HISTORY_TURNS = 6  # user+assistant pairs kept from client-supplied history
 RATE_LIMIT_PER_HOUR = 20  # per IP, in-memory (resets on redeploy -- fine for a PoC)
@@ -1036,6 +1046,7 @@ def build_app() -> Starlette:
     mcp_app.add_middleware(
         CORSMiddleware,
         allow_origins=CHAT_ALLOWED_ORIGINS,
+        allow_origin_regex=CHAT_ALLOWED_ORIGIN_REGEX,
         allow_methods=["POST", "GET", "OPTIONS"],
         allow_headers=["*"],
     )
